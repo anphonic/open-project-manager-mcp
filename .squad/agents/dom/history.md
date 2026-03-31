@@ -26,3 +26,13 @@ Cast into the squad to fill the security role gap identified after the initial i
 5. **Path traversal via --db-path:** Documented as Info/low risk for v1 single-tenant; no fix required at this time
 
 **Artefact:** `.squad/agents/dom/security-audit-v0.1.0.txt`
+
+### 2026-03-31 — Auth implementation aligns with security recommendations
+
+Dom was not directly invoked this session. Darlene implemented multi-tenant bearer token auth (OPM_TENANT_KEYS) which addresses the outstanding network auth gap flagged in the v0.1.0 audit (item 5: path traversal note mentioned single-tenant scope; auth was the broader concern for network mode).
+
+**Alignment with prior recommendations:**
+- `ApiKeyVerifier` uses `hmac.compare_digest` — constant-time comparison, immune to timing attacks
+- Tokens generated via `secrets.token_hex(32)` — cryptographically secure, 256-bit entropy
+- Missing/malformed Authorization headers return 401 before any tool logic executes
+- Three squads provisioned on skitterphuger; tokens stored chmod 600

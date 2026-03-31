@@ -37,4 +37,18 @@ The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly
 - `limit=0`: accepted and forwarded to SQLite `LIMIT 0`, silently returning no results → clamped to minimum 1
 - Updated docstrings on both list tools to document the compact payload shape
 
+### 2026-03-31 — Multi-tenant bearer token auth
+
+**Task:** Implement OPM_TENANT_KEYS support (mirrors squad-knowledge-mcp pattern).
+
+**Work completed:**
+- `_load_tenant_keys()` in `__main__.py` — reads `OPM_TENANT_KEYS` env var, normalizes old/new formats into `{squad: token}` dict
+- `ApiKeyVerifier` class in `server.py` — constant-time `hmac.compare_digest` Bearer token validation
+- `AuthSettings` wired into `FastMCP` when `tenant_keys` provided
+- `create_server()` updated to accept `tenant_keys: dict[str, str] | None` and `server_url: str | None`
+- `--generate-token SQUAD_NAME` CLI flag — prints cryptographically secure token + setup instructions, exits
+- `_check_network_auth()` updated with `tenant_keys` parameter for context-aware warnings
+
+**Test results:** +11 tests → 81/81 passing.
+
 ## Learnings

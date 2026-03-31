@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import sys
 
 import platformdirs
@@ -60,22 +61,69 @@ class _FixArgumentsMiddleware:
         await self.app(scope, patched_receive, original_send)
 
 
-def _check_network_auth(host: str, port: int, allow_unauth: bool, transport_name: str) -> None:
-    """Warn or refuse to bind a network transport to non-localhost without acknowledgement."""
+def _load_tenant_keys() -> dict[str, dict[str, object]] | None:
+    """Load tenant API keys from OPM_TENANT_KEYS env var.
+
+    Supports two formats (may be mixed):
+      - Old: {"squadname": "bearer-token"}
+      - New: {"squadname": {"key": "bearer-token"}}
+
+    Returns a normalized dict-of-dicts:
+      {"squadname": {"key": "bearer-token"}}
+    """
+    raw = os.environ.get("OPM_TENANT_KEYS")
+    if not raw:
+        return None
+    try:
+        keys = json.loads(raw)
+        if not isinstance(keys, dict):
+            raise ValueError("OPM_TENANT_KEYS must be a JSON object")
+        normalized: dict[str, dict[str, object]] = {}
+        for tenant_id, value in keys.items():
+            if not isinstance(tenant_id, str) or not tenant_id:
+                raise ValueError(f"Tenant ID must be a non-empty string, got: {tenant_id!r}")
+            if isinstance(value, str):
+                if not value:
+                    raise ValueError(f"API key for tenant '{tenant_id}' must be a non-empty string")
+                normalized[tenant_id] = {"key": value}
+            elif isinstance(value, dict):
+                key = value.get("key")
+                if not isinstance(key, str) or not key:
+                    raise ValueError(f"Tenant '{tenant_id}' must have a non-empty string 'key' field")
+                normalized[tenant_id] = {"key": key}
+            else:
+                raise ValueError(f"Tenant '{tenant_id}' value must be a string or object")
+        return normalized
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"FATAL: Invalid OPM_TENANT_KEYS: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _check_network_auth(
+    host: str, port: int, tenant_keys: dict | None, allow_unauth: bool, transport_name: str
+) -> None:
+    """Refuse to bind a network transport to non-localhost without auth."""
     localhost_addrs = ("127.0.0.1", "localhost", "::1")
-    if host not in localhost_addrs and not allow_unauth:
+    if not tenant_keys:
+        if host not in localhost_addrs and not allow_unauth:
+            print(
+                f"FATAL: Refusing to bind to {host}:{port} in {transport_name} mode without authentication. "
+                "Set OPM_TENANT_KEYS or pass --allow-unauthenticated-network to override (development only).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            print(
+                f"Notice: {transport_name} mode active without OPM_TENANT_KEYS — server is unauthenticated. "
+                "Any process that can reach this endpoint can read/write tasks.",
+                file=sys.stderr,
+            )
+    elif host not in localhost_addrs:
         print(
-            f"FATAL: Refusing to bind to {host}:{port} in {transport_name} mode without "
-            "--allow-unauthenticated-network. This server has no authentication in v1; "
-            "pass the flag to confirm you accept the risk (development/LAN only).",
+            f"WARNING: {transport_name} mode on {host}:{port} with bearer token auth. "
+            "Tokens will be transmitted in plaintext — use a TLS-terminating reverse proxy in production.",
             file=sys.stderr,
         )
-        sys.exit(1)
-    print(
-        f"Notice: {transport_name} mode active — server is unauthenticated. "
-        "Any process that can reach this endpoint can read/write tasks.",
-        file=sys.stderr,
-    )
 
 
 def main():
@@ -127,8 +175,28 @@ def main():
         type=int,
         help="Max concurrent connections for HTTP/SSE mode (env: OPM_MAX_CONNECTIONS, default: 100)",
     )
+    parser.add_argument(
+        "--generate-token",
+        type=str,
+        metavar="SQUAD_NAME",
+        help="Generate a bearer token for the named squad and print OPM_TENANT_KEYS instructions, then exit",
+    )
 
     args = parser.parse_args()
+
+    # Handle --generate-token before doing anything else
+    if args.generate_token:
+        squad = args.generate_token
+        token = secrets.token_urlsafe(32)
+        existing_hint = json.dumps({squad: {"key": token}})
+        print(f"Generated bearer token for squad '{squad}':")
+        print(f"  Token: {token}")
+        print()
+        print("Add to OPM_TENANT_KEYS (merge with any existing entries):")
+        print(f"  OPM_TENANT_KEYS='{existing_hint}'")
+        print()
+        print("Restart open-project-manager-mcp with --http to enable bearer token auth.")
+        return
 
     raw_db_path = args.db_path or os.environ.get("OPM_DB_PATH") or default_db
     db_path = os.path.abspath(raw_db_path)
@@ -149,6 +217,9 @@ def main():
         )
         sys.exit(1)
 
+    tenant_keys = _load_tenant_keys()
+    flat_keys = {t: v["key"] for t, v in tenant_keys.items()} if tenant_keys else None
+
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     print(f"Database path: {db_path}", file=sys.stderr)
 
@@ -164,10 +235,11 @@ def main():
         from mcp.server.transport_security import TransportSecuritySettings
         _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
-    mcp = create_server(db_path, transport_security=_transport_security)
+    server_url = f"http://{host}:{port}"
+    mcp = create_server(db_path, tenant_keys=flat_keys, server_url=server_url, transport_security=_transport_security)
 
     if args.http or args.sse:
-        _check_network_auth(host, port, args.allow_unauthenticated_network, "HTTP" if args.http else "SSE")
+        _check_network_auth(host, port, flat_keys, args.allow_unauthenticated_network, "HTTP" if args.http else "SSE")
         try:
             import uvicorn
             from starlette.applications import Starlette

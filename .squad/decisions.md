@@ -29,3 +29,17 @@
 8. **`list_ready_tasks`** — Default `n_results=10`, cap `MAX_N_RESULTS=100`.
 
 **Decision:** Darlene cleared to begin implementation on core scaffold. (Superseded: coordinator built full implementation this session.)
+
+## 2026-03-31: Multi-tenant bearer token auth implemented
+
+**Decision:** Add `OPM_TENANT_KEYS` support, mirroring the squad-knowledge-mcp pattern.  
+**Rationale:** HTTP mode exposes the server on the LAN; bearer token auth gates access per squad without requiring infrastructure changes. Tasks are **not** tenant-scoped — the `project` field handles data separation. Provisioned squads: mrrobot, westworld, fsociety.  
+**Implementation:** `ApiKeyVerifier` with `hmac.compare_digest`; `--generate-token SQUAD_NAME` CLI for provisioning; `AuthSettings` wired into FastMCP when keys present.
+
+## 2026-03-31: Deployed to skitterphuger
+
+**Decision:** Run open-project-manager-mcp in production on the home LAN server.  
+**Host:** 192.168.1.178, Port: 8765, HTTP mode, 3 tenants (mrrobot, westworld, fsociety).  
+**DB:** `/home/skitterphuger/mcp/open-project-manager/tasks.db`  
+**Start script:** `/home/skitterphuger/mcp/open-project-manager/start.sh`  
+**Tokens:** Stored in `.env` (chmod 600) alongside start script.

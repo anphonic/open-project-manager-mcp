@@ -1,13 +1,17 @@
 """SQLite-backed project management MCP server."""
 
 import asyncio
+import hmac
 import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.authentication import AuthenticationError
 
 VALID_PRIORITIES = {"critical", "high", "medium", "low"}
 VALID_STATUSES = {"pending", "in_progress", "done", "blocked"}
@@ -30,6 +34,32 @@ _PRIORITY_CASE = (
     "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
     "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END"
 )
+
+
+class ApiKeyVerifier(TokenVerifier):
+    """Validates Bearer API keys and injects tenant_id into token claims."""
+
+    def __init__(self, tenant_keys: dict[str, str]):
+        self._tenants: list[tuple[str, str]] = list(tenant_keys.items())
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            matched_tenant = None
+            for tenant_id, api_key in self._tenants:
+                if hmac.compare_digest(token, api_key):
+                    matched_tenant = tenant_id
+                    break
+            if not matched_tenant:
+                raise AuthenticationError("Invalid API key")
+            return AccessToken(
+                token=token,
+                client_id=matched_tenant,
+                scopes=["api"],
+            )
+        except AuthenticationError:
+            raise
+        except Exception:
+            raise AuthenticationError("Authentication failed") from None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -58,12 +88,17 @@ CREATE TABLE IF NOT EXISTS task_deps (
 
 def create_server(
     db_path: str,
+    tenant_keys: Optional[dict[str, str]] = None,
+    server_url: str = "http://localhost:8765",
     transport_security: Optional[TransportSecuritySettings] = None,
 ) -> FastMCP:
     """Create and return the project manager MCP server backed by SQLite at db_path.
 
     Args:
         db_path: Path to the SQLite database file.
+        tenant_keys: Dict of {tenant_id: api_key}. If provided, enables bearer token
+            authentication via FastMCP's ApiKeyVerifier. If None, server runs unauthenticated.
+        server_url: Base URL used in AuthSettings (issuer/resource server URLs).
         transport_security: DNS rebinding / Host-header validation settings passed
             directly to FastMCP. Pass
             ``TransportSecuritySettings(enable_dns_rebinding_protection=False)``
@@ -76,7 +111,17 @@ def create_server(
     conn.commit()
 
     _lock = asyncio.Lock()
-    mcp = FastMCP("open-project-manager-mcp", transport_security=transport_security)
+
+    auth_settings = None
+    token_verifier = None
+    if tenant_keys:
+        token_verifier = ApiKeyVerifier(tenant_keys)
+        auth_settings = AuthSettings(
+            issuer_url=server_url,
+            resource_server_url=server_url,
+        )
+
+    mcp = FastMCP("open-project-manager-mcp", token_verifier=token_verifier, auth=auth_settings, transport_security=transport_security)
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()

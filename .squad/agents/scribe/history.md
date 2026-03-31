@@ -34,6 +34,16 @@ Session Logger. I maintain memory, decisions, and logs for the team.
 - Added Dom to `.squad/routing.md` (Security vulnerabilities, input validation, transport auth)
 - Committed all changes: `review: squad review round — 5 agents, 10 findings fixed`
 
+### 2026-03-31 — Auth + deployment logging session
+
+**Actions taken this session:**
+- Created `.squad/orchestration-log/20260331T224608Z-deploy.md` documenting Darlene's auth work and coordinator deployment to skitterphuger
+- Updated history.md for Darlene (auth implementation, OPM_TENANT_KEYS, --generate-token, 81 tests)
+- Updated history.md for Dom (note that auth aligns with her security recommendations)
+- Updated history.md for Scribe (this entry)
+- Added two new decisions to `.squad/decisions.md`: multi-tenant auth + deployment to skitterphuger
+- Committed all changes: `feat: multi-tenant bearer token auth + deploy to skitterphuger`
+
 ## Learnings
 
 - Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)

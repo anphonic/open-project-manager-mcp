@@ -11,6 +11,7 @@ import pytest
 from open_project_manager_mcp.__main__ import (
     _FixArgumentsMiddleware,
     _check_network_auth,
+    _load_tenant_keys,
     main,
 )
 
@@ -35,7 +36,7 @@ def _run_main(argv, env_overrides=None):
         return mock_mcp
 
     env = dict(os.environ)
-    for key in ["OPM_DB_PATH", "OPM_HOST", "OPM_PORT", "OPM_MAX_CONNECTIONS"]:
+    for key in ["OPM_DB_PATH", "OPM_HOST", "OPM_PORT", "OPM_MAX_CONNECTIONS", "OPM_TENANT_KEYS"]:
         env.pop(key, None)
     if env_overrides:
         env.update(env_overrides)
@@ -140,18 +141,25 @@ class TestSseTransport:
 class TestCheckNetworkAuth:
     def test_non_localhost_without_flag_exits(self):
         with pytest.raises(SystemExit):
-            _check_network_auth("192.168.1.1", 8765, allow_unauth=False, transport_name="HTTP")
+            _check_network_auth("192.168.1.1", 8765, tenant_keys=None, allow_unauth=False, transport_name="HTTP")
 
     def test_non_localhost_with_flag_does_not_exit(self):
         # Should not raise
-        _check_network_auth("192.168.1.1", 8765, allow_unauth=True, transport_name="HTTP")
+        _check_network_auth("192.168.1.1", 8765, tenant_keys=None, allow_unauth=True, transport_name="HTTP")
 
     def test_localhost_does_not_exit(self):
         # Should not raise even without flag
-        _check_network_auth("127.0.0.1", 8765, allow_unauth=False, transport_name="HTTP")
+        _check_network_auth("127.0.0.1", 8765, tenant_keys=None, allow_unauth=False, transport_name="HTTP")
 
     def test_localhost_ipv6_does_not_exit(self):
-        _check_network_auth("::1", 8765, allow_unauth=False, transport_name="HTTP")
+        _check_network_auth("::1", 8765, tenant_keys=None, allow_unauth=False, transport_name="HTTP")
+
+    def test_non_localhost_with_tenant_keys_does_not_exit(self):
+        # Auth configured — should warn but not exit
+        _check_network_auth("192.168.1.1", 8765, tenant_keys={"squad": "token"}, allow_unauth=False, transport_name="HTTP")
+
+    def test_localhost_with_tenant_keys_does_not_exit(self):
+        _check_network_auth("127.0.0.1", 8765, tenant_keys={"squad": "token"}, allow_unauth=False, transport_name="HTTP")
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +260,84 @@ class TestFixArgumentsMiddleware:
             lambda _: None,
         ))
         assert captured[0] == body
+
+
+# ---------------------------------------------------------------------------
+# _load_tenant_keys
+# ---------------------------------------------------------------------------
+
+class TestLoadTenantKeys:
+    def test_returns_none_when_not_set(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert _load_tenant_keys() is None
+
+    def test_old_format_string_value(self):
+        raw = json.dumps({"westworld": "mytoken"})
+        with patch.dict(os.environ, {"OPM_TENANT_KEYS": raw}, clear=True):
+            result = _load_tenant_keys()
+        assert result == {"westworld": {"key": "mytoken"}}
+
+    def test_new_format_dict_value(self):
+        raw = json.dumps({"westworld": {"key": "mytoken"}})
+        with patch.dict(os.environ, {"OPM_TENANT_KEYS": raw}, clear=True):
+            result = _load_tenant_keys()
+        assert result == {"westworld": {"key": "mytoken"}}
+
+    def test_invalid_json_exits(self):
+        with patch.dict(os.environ, {"OPM_TENANT_KEYS": "not-json"}, clear=True):
+            with pytest.raises(SystemExit):
+                _load_tenant_keys()
+
+    def test_empty_key_exits(self):
+        raw = json.dumps({"westworld": ""})
+        with patch.dict(os.environ, {"OPM_TENANT_KEYS": raw}, clear=True):
+            with pytest.raises(SystemExit):
+                _load_tenant_keys()
+
+
+# ---------------------------------------------------------------------------
+# --generate-token
+# ---------------------------------------------------------------------------
+
+class TestGenerateToken:
+    def test_generate_token_exits_zero(self, capsys):
+        with patch.object(sys, "argv", ["open-project-manager-mcp", "--generate-token", "westworld"]):
+            with patch.dict(os.environ, {}, clear=True):
+                main()  # should return without sys.exit
+        out = capsys.readouterr().out
+        assert "westworld" in out
+
+    def test_generate_token_prints_token(self, capsys):
+        with patch.object(sys, "argv", ["open-project-manager-mcp", "--generate-token", "westworld"]):
+            with patch.dict(os.environ, {}, clear=True):
+                main()
+        out = capsys.readouterr().out
+        assert "Token:" in out
+        assert "OPM_TENANT_KEYS" in out
+
+    def test_generate_token_is_url_safe(self, capsys):
+        import re
+        with patch.object(sys, "argv", ["open-project-manager-mcp", "--generate-token", "westworld"]):
+            with patch.dict(os.environ, {}, clear=True):
+                main()
+        out = capsys.readouterr().out
+        # Extract the token line
+        for line in out.splitlines():
+            if "Token:" in line:
+                token = line.split("Token:")[-1].strip()
+                # URL-safe base64 characters only (letters, digits, - and _)
+                assert re.match(r'^[A-Za-z0-9\-_]+$', token), f"Token not URL-safe: {token}"
+                assert len(token) >= 40, f"Token too short: {token}"
+                break
+        else:
+            pytest.fail("No token line found in output")
+
+    def test_generate_token_does_not_start_server(self, capsys):
+        """--generate-token must exit before touching db or server."""
+        with patch.object(sys, "argv", ["open-project-manager-mcp", "--generate-token", "westworld"]):
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("open_project_manager_mcp.__main__._load_tenant_keys") as mock_load:
+                    main()
+                    # _load_tenant_keys should NOT be called — we return before it
+                    mock_load.assert_not_called()
+
