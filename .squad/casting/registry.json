@@ -1,0 +1,10 @@
+{
+  "agents": [
+    {"persistent_name": "Elliot", "universe": "mr-robot", "role": "Lead & Architect", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Darlene", "universe": "mr-robot", "role": "Backend Dev", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Romero", "universe": "mr-robot", "role": "Tester", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Angela", "universe": "mr-robot", "role": "DevRel & Docs", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Scribe", "universe": "scribe", "role": "Session Logger", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Ralph", "universe": "ralph", "role": "Work Monitor", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"}
+  ]
+}
