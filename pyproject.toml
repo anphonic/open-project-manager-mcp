@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-project-manager-mcp"
+version = "0.1.0"
+description = "SQLite-backed project management MCP server for AI agent squads"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0,<2.0",
+    "platformdirs>=3.0,<5.0",
+]
+
+[project.scripts]
+open-project-manager-mcp = "open_project_manager_mcp.__main__:main"
+
+[project.optional-dependencies]
+http = [
+    "uvicorn>=0.20",
+    "starlette>=0.27",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.0",
+    "anyio[trio]>=3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open_project_manager_mcp"]

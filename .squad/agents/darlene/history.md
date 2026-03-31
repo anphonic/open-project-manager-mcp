@@ -10,4 +10,21 @@
 ## Role
 Backend Dev. I implement server.py and all MCP tools.
 
+## Session Log
+
+### 2026-03-31 — Initial implementation session
+
+**Status:** Did not author code this session.
+
+The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly, bypassing squad routing. Darlene was not invoked.
+
+**What was built (by coordinator, on Darlene's behalf):**
+- `src/open_project_manager_mcp/server.py`: `create_server(db_path)` factory, 11 tools as closures, `asyncio.Lock` for writes, SQLite via stdlib `sqlite3`
+- Tools: `create_task`, `update_task`, `complete_task`, `delete_task`, `get_task`, `list_tasks`, `add_dependency`, `remove_dependency`, `list_ready_tasks`, `list_projects`, `get_stats`
+- `human_approval=True` on `delete_task`
+- Priority sort: critical > high > medium > low
+- All 44 tool tests pass
+
+**Process note:** In future sessions, `server.py` and tool work should be routed to Darlene.
+
 ## Learnings
