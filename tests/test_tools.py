@@ -109,6 +109,18 @@ class TestUpdateTask:
         result = mcp_server._get("update_task")(task_id="u5", status="flying")
         assert "Error" in result
 
+    def test_updates_tags(self, mcp_server):
+        mcp_server._get("create_task")(id="u6", title="Task")
+        mcp_server._get("update_task")(task_id="u6", tags=["x", "y"])
+        task = json.loads(mcp_server._get("get_task")(task_id="u6"))
+        assert task["tags"] == ["x", "y"]
+
+    def test_updates_assignee(self, mcp_server):
+        mcp_server._get("create_task")(id="u7", title="Task")
+        mcp_server._get("update_task")(task_id="u7", assignee="bob")
+        task = json.loads(mcp_server._get("get_task")(task_id="u7"))
+        assert task["assignee"] == "bob"
+
 
 # ---------------------------------------------------------------------------
 # complete_task
@@ -205,8 +217,8 @@ class TestListTasks:
         mcp_server._get("create_task")(id="l3", title="X", project="alpha")
         mcp_server._get("create_task")(id="l4", title="Y", project="beta")
         result = json.loads(mcp_server._get("list_tasks")(project="alpha"))
-        assert all(t["project"] == "alpha" for t in result["tasks"])
         assert len(result["tasks"]) == 1
+        assert result["tasks"][0]["id"] == "l3"
 
     def test_filter_by_status(self, mcp_server):
         mcp_server._get("create_task")(id="l5", title="A")
@@ -236,6 +248,20 @@ class TestListTasks:
         result = json.loads(mcp_server._get("list_tasks")(limit=10))
         assert result["has_more"] is False
 
+    def test_filter_by_assignee(self, mcp_server):
+        mcp_server._get("create_task")(id="la1", title="Assigned", assignee="alice")
+        mcp_server._get("create_task")(id="la2", title="Unassigned")
+        result = json.loads(mcp_server._get("list_tasks")(assignee="alice"))
+        assert len(result["tasks"]) == 1
+        assert result["tasks"][0]["assignee"] == "alice"
+
+    def test_filter_by_priority(self, mcp_server):
+        mcp_server._get("create_task")(id="lp1", title="Critical", priority="critical")
+        mcp_server._get("create_task")(id="lp2", title="Low", priority="low")
+        result = json.loads(mcp_server._get("list_tasks")(priority="critical"))
+        assert len(result["tasks"]) == 1
+        assert result["tasks"][0]["priority"] == "critical"
+
 
 # ---------------------------------------------------------------------------
 # add_dependency / remove_dependency
@@ -257,6 +283,11 @@ class TestDependencies:
     def test_missing_task_returns_error(self, mcp_server):
         mcp_server._get("create_task")(id="exists", title="Exists")
         result = mcp_server._get("add_dependency")(task_id="exists", depends_on_id="ghost")
+        assert "Error" in result
+
+    def test_first_task_missing_returns_error(self, mcp_server):
+        mcp_server._get("create_task")(id="dep_exists", title="Exists")
+        result = mcp_server._get("add_dependency")(task_id="dep_ghost", depends_on_id="dep_exists")
         assert "Error" in result
 
     def test_duplicate_dependency_reports_exists(self, mcp_server):
@@ -317,6 +348,13 @@ class TestListReadyTasks:
         assert "ra" in ids
         assert "rb" not in ids
 
+    def test_filter_by_assignee(self, mcp_server):
+        mcp_server._get("create_task")(id="rac", title="Alice task", assignee="alice")
+        mcp_server._get("create_task")(id="rbc", title="Bob task", assignee="bob")
+        ids = [t["id"] for t in json.loads(mcp_server._get("list_ready_tasks")(assignee="alice"))["tasks"]]
+        assert "rac" in ids
+        assert "rbc" not in ids
+
 
 # ---------------------------------------------------------------------------
 # list_projects
@@ -369,3 +407,8 @@ class TestGetStats:
     def test_empty_db_returns_null_oldest(self, mcp_server):
         result = json.loads(mcp_server._get("get_stats")())
         assert result["oldest_open"] is None
+
+    def test_oldest_open_has_value(self, mcp_server):
+        mcp_server._get("create_task")(id="s6", title="Open task")
+        result = json.loads(mcp_server._get("get_stats")())
+        assert result["oldest_open"] is not None

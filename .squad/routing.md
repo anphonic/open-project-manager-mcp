@@ -8,3 +8,4 @@
 | README, docs, pyproject.toml metadata | Angela | DevRel |
 | Logs, decisions, git commits | Scribe | Logger |
 | GitHub issues, PR queue | Ralph | Monitor |
+| Security vulnerabilities, input validation, transport auth | Dom | Security Expert |

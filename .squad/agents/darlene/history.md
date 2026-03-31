@@ -27,4 +27,14 @@ The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly
 
 **Process note:** In future sessions, `server.py` and tool work should be routed to Darlene.
 
+### 2026-03-31 — Backend review (v0.1.0 review round)
+
+**Task:** Review `server.py` and all tool implementations against CHARTER design principles.
+
+**Fixes made:**
+- `list_tasks`: was returning full row dicts → fixed to compact payload `(id, title, priority, status, assignee)` per CHARTER list-endpoint design principle
+- `list_ready_tasks`: same full-row return issue → same compact fix applied
+- `limit=0`: accepted and forwarded to SQLite `LIMIT 0`, silently returning no results → clamped to minimum 1
+- Updated docstrings on both list tools to document the compact payload shape
+
 ## Learnings

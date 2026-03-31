@@ -154,7 +154,17 @@ def main():
 
     from .server import create_server
 
-    mcp = create_server(db_path)
+    # Resolve transport security before creating the server so FastMCP can be
+    # configured correctly.  When binding to a non-localhost interface, disable
+    # DNS rebinding protection so LAN clients whose Host header differs from
+    # 127.0.0.1 are not rejected by FastMCP.
+    _transport_security = None
+    localhost_addrs = ("127.0.0.1", "localhost", "::1")
+    if (args.http or args.sse) and host not in localhost_addrs:
+        from mcp.server.transport_security import TransportSecuritySettings
+        _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    mcp = create_server(db_path, transport_security=_transport_security)
 
     if args.http or args.sse:
         _check_network_auth(host, port, args.allow_unauthenticated_network, "HTTP" if args.http else "SSE")
@@ -169,11 +179,6 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-
-        localhost_addrs = ("127.0.0.1", "localhost", "::1")
-        if host not in localhost_addrs:
-            from mcp.server.transport_security import TransportSecuritySettings
-            TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
         def _make_lifespan(inner_app):
             from contextlib import asynccontextmanager

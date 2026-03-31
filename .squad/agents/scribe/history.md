@@ -22,6 +22,18 @@ Session Logger. I maintain memory, decisions, and logs for the team.
 
 **Process deviation noted:** Coordinator built the full implementation directly without routing to squad agents. Logged in orchestration log and agent histories.
 
+### 2026-03-31 — Review round logging session (v0.1.0 review round)
+
+**Actions taken this session:**
+- Created `.squad/orchestration-log/20260331T223819Z-review-round.md` documenting all five review agents, their findings, and changes made
+- Updated history.md for Elliot (TransportSecuritySettings critical fix)
+- Updated history.md for Darlene (compact payload fix, limit=0 guard)
+- Updated history.md for Romero (70 tests, +10 new, SSE transport coverage)
+- Updated history.md for Angela (README + CHARTER ingested to squad knowledge server)
+- Replaced stub history.md for Dom with full entry (security audit, 5 issues fixed)
+- Added Dom to `.squad/routing.md` (Security vulnerabilities, input validation, transport auth)
+- Committed all changes: `review: squad review round — 5 agents, 10 findings fixed`
+
 ## Learnings
 
 - Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)

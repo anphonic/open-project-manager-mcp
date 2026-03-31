@@ -17,6 +17,7 @@
 | Romero | Tester | `.squad/agents/romero/charter.md` | 🟢 Active |
 | Angela | DevRel & Docs | `.squad/agents/angela/charter.md` | 🟢 Active |
 | Scribe | Session Logger | `.squad/agents/scribe/charter.md` | 🟢 Active |
+| Dom | Security Expert | `.squad/agents/dom/charter.md` | 🟢 Active |
 | Ralph | Work Monitor | — | 🔄 Monitor |
 
 ## Project Context

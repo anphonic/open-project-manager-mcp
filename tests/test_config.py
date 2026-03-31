@@ -30,7 +30,7 @@ def _run_main(argv, env_overrides=None):
     mock_uvicorn = MagicMock()
     captured_db_path = []
 
-    def fake_create_server(db_path):
+    def fake_create_server(db_path, **kwargs):
         captured_db_path.append(db_path)
         return mock_mcp
 
@@ -109,6 +109,31 @@ class TestHttpTransport:
 
 
 # ---------------------------------------------------------------------------
+# SSE transport
+# ---------------------------------------------------------------------------
+
+class TestSseTransport:
+    def test_sse_mode_calls_uvicorn_run(self):
+        _, _, mock_uvicorn = _run_main(
+            ["open-project-manager-mcp", "--sse", "--allow-unauthenticated-network"]
+        )
+        assert mock_uvicorn.run.called
+
+    def test_sse_mode_uses_specified_port(self):
+        _, _, mock_uvicorn = _run_main(
+            ["open-project-manager-mcp", "--sse", "--port", "9091", "--allow-unauthenticated-network"]
+        )
+        call_kwargs = mock_uvicorn.run.call_args.kwargs
+        assert call_kwargs["port"] == 9091
+
+    def test_sse_mode_does_not_call_run_stdio_async(self):
+        mock_mcp, _, _ = _run_main(
+            ["open-project-manager-mcp", "--sse", "--allow-unauthenticated-network"]
+        )
+        mock_mcp.run_stdio_async.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _check_network_auth
 # ---------------------------------------------------------------------------
 
@@ -150,7 +175,6 @@ class TestFixArgumentsMiddleware:
         return captured[0] if captured else b""
 
     def test_coerces_empty_list_to_empty_dict(self):
-        middleware = _FixArgumentsMiddleware(lambda s, r, snd: None)
         body = json.dumps({
             "method": "tools/call",
             "params": {"name": "get_stats", "arguments": []},

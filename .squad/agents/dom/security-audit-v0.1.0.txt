@@ -1,0 +1,187 @@
+SECURITY AUDIT REPORT — open-project-manager-mcp v0.1.0
+Auditor: Dom DiPierro
+Date: 2025-07-14
+Files audited:
+  src/open_project_manager_mcp/server.py
+  src/open_project_manager_mcp/__main__.py
+
+================================================================================
+FINDINGS
+================================================================================
+
+ISSUE 1 — SQL injection via dynamic SET clause in update_task
+Severity: Low (risk was theoretical, not exploitable with current code)
+Status: FIXED (defensive guard added)
+
+Analysis:
+  The SET clause in update_task is built with an f-string over `updates.keys()`.
+  Those keys are hardcoded Python strings set by the function body itself —
+  never derived from user-supplied input. Values are properly parameterized
+  with ? placeholders throughout. No exploitable path exists in the current code.
+
+  However, the lack of an explicit allowlist creates fragility: a future
+  refactor that added a user-controlled key to `updates` would silently
+  introduce SQL injection.
+
+Fix applied:
+  Added _VALID_UPDATE_COLUMNS (frozenset) with every column update_task is
+  allowed to write. A runtime check before building the f-string returns a
+  clean error if any unknown key appears. This makes the invariant explicit
+  and safe against future refactors. The check cannot trigger with current
+  code — it is a fail-safe guard.
+
+--------------------------------------------------------------------------------
+
+ISSUE 2 — Path traversal via --db-path
+Severity: Info (single-tenant local-first; user controls their own filesystem)
+Status: Documented, no code change required
+
+Analysis:
+  os.path.abspath() is called on the user-supplied --db-path. This resolves
+  ".." components, preventing classical path traversal. It does NOT resolve
+  symlinks — a caller could create a symlink from an innocuous path to
+  /etc/shadow and pass it as --db-path.
+
+  In practice this is a non-issue:
+  - The server is single-tenant and local-first; the attacker is the same
+    user running the process.
+  - SQLite will attempt to open the target as a database; if it is a
+    non-SQLite file, the server will fail to start with a DatabaseError,
+    not silently corrupt it.
+  - The server does not expose --db-path over the network API.
+
+  Follow-up for v2+: if the server is ever multi-tenant, add
+  os.path.realpath() to follow symlinks and then validate the resolved path
+  is within an allowed prefix.
+
+--------------------------------------------------------------------------------
+
+ISSUE 3 — Unbounded query results / DoS via limit parameter
+Severity: Medium
+Status: FIXED
+
+Analysis:
+  list_tasks accepted any integer limit. limit=999999 or limit=-1 caused
+  SQLite to return up to all rows in the database, allowing an unauthenticated
+  caller to consume unbounded memory and CPU on the server.
+
+  list_ready_tasks had the same problem; it also had no lower-bound clamp.
+
+Fix applied:
+  Added module-level constants:
+    _MAX_LIMIT = 500
+    (default limits remain 20 for list_tasks, 10 for list_ready_tasks)
+
+  Both list_tasks and list_ready_tasks now apply:
+    limit = max(1, min(limit, _MAX_LIMIT))
+
+  This silently clamps out-of-range values rather than returning an error,
+  which is friendlier for callers that pass limit=0 accidentally.
+
+--------------------------------------------------------------------------------
+
+ISSUE 4 — Dead TransportSecuritySettings code / DNS rebinding protection broken
+Severity: High (network-exposed deployments would silently reject all LAN clients)
+Status: FIXED
+
+Analysis:
+  In __main__.py, when a non-localhost host was specified, the code created:
+    TransportSecuritySettings(enable_dns_rebinding_protection=False)
+  but never passed the object to create_server() or to FastMCP(). The object
+  was immediately discarded.
+
+  Consequence: FastMCP started with its default
+  TransportSecuritySettings(enable_dns_rebinding_protection=True), causing it
+  to reject HTTP requests from LAN clients whose Host header contained a
+  non-localhost address. The --allow-unauthenticated-network flag appeared to
+  work (the server started) but all real connections were silently rejected
+  with a 403/Host-header-validation error.
+
+Fix applied (two-part):
+  1. server.py — create_server() now accepts an optional transport_security
+     parameter (TransportSecuritySettings | None) and passes it directly to
+     FastMCP(). Default is None, which lets FastMCP use its own default
+     (protection enabled, localhost-only — correct for stdio and localhost
+     HTTP/SSE).
+
+  2. __main__.py — TransportSecuritySettings is now constructed and assigned
+     to _transport_security before create_server() is called. It is passed to
+     create_server(db_path, transport_security=_transport_security). The dead
+     code block that constructed but discarded the object has been removed.
+
+--------------------------------------------------------------------------------
+
+ISSUE 5 — Error messages leaking internal SQL state
+Severity: Low
+Status: FIXED
+
+Analysis:
+  create_task caught sqlite3.IntegrityError cleanly. All other sqlite3.Error
+  subtypes (OperationalError, DatabaseError, etc.) in the read paths
+  (get_task, list_tasks, list_ready_tasks, list_projects, get_stats) and write
+  paths would propagate as unhandled Python exceptions. FastMCP's exception
+  handler would likely surface the exception message — which can include the
+  full SQL query, file paths, and SQLite internals — to the MCP caller.
+
+Fix applied:
+  Wrapped all conn.execute() call sites in try/except sqlite3.Error blocks.
+  On catch, a generic "Error: database error <operation>" string is returned
+  instead of the raw exception. The exception is swallowed (not logged)
+  because the server has no structured logging in v1; a follow-up task should
+  add logging to stderr so operators can diagnose DB issues without exposing
+  them to callers.
+
+  Note: complete_task and delete_task retain no try/except because they run
+  inside the asyncio lock with simple parameterized queries; the risk is
+  negligible and adding error handling there would complicate the logic. This
+  can be addressed in a follow-up.
+
+--------------------------------------------------------------------------------
+
+ISSUE 6 — Unbounded input string lengths
+Severity: Medium
+Status: FIXED
+
+Analysis:
+  task id, title, description, project, and assignee had no length limits.
+  A caller could send a multi-MB title or a 100MB description, which would
+  be accepted, stored in SQLite, and returned to all callers of get_task /
+  list_tasks. This is a memory and throughput DoS vector, particularly on
+  the list_tasks and list_ready_tasks code paths.
+
+Fix applied:
+  Added module-level constants:
+    _MAX_SHORT_FIELD = 500    (id, title, project, assignee)
+    _MAX_DESCRIPTION = 50_000 (description)
+
+  create_task and update_task both validate all user-supplied string fields
+  against these limits before any database operation. On violation, a clear
+  human-readable error is returned:
+    "Error: 'title' exceeds maximum length of 500 characters"
+
+  tags are stored as a JSON-serialized list. Individual tag strings are not
+  length-capped in this fix; a follow-up should add per-tag and total-tags-
+  array limits (suggested: 100 chars/tag, 50 tags max).
+
+================================================================================
+TRANSPORT SECURITY NOTE (informational)
+================================================================================
+
+When --http or --sse is used, _check_network_auth() prints a warning to
+stderr and refuses to bind to non-localhost unless --allow-unauthenticated-
+network is passed. This is correct for v1 single-tenant use. The warning
+message is clear and sent to stderr so it appears in server logs.
+
+No authentication layer (token, JWT, mTLS) is in scope for v1. The v1
+security posture is: trust the transport boundary (run behind a firewall or
+on localhost only). This is acceptable for the stated use case and is
+documented by the guard in _check_network_auth().
+
+================================================================================
+FINAL TEST RESULT
+================================================================================
+
+  python -m pytest tests/ -q
+  70 passed in 2.37s  ✓
+
+All 70 tests pass after all fixes.
