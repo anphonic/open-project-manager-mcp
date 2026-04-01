@@ -51,4 +51,20 @@ The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly
 
 **Test results:** +11 tests → 81/81 passing.
 
+### 2026-04-01 — Implemented all 7 v0.2.0 features
+
+**Task:** Implement all features per Elliot's architecture brief, incorporating Trenton (schema) and Mobley (API/webhook) review notes.
+
+**Features implemented:**
+
+1. **due-dates:** `due_date` column migration (try/except OperationalError); ISO 8601 validation; `list_overdue_tasks`, `list_due_soon_tasks` tools
+2. **full-text-search:** FTS5 virtual table + 3 triggers + post-schema rebuild; `search_tasks` with BM25 ranking; `_fts_available` flag; error messages sanitized (Dom)
+3. **bulk-operations:** `create_tasks`, `update_tasks`, `complete_tasks`; `_validate_create/update_params()` helpers; single transaction per call; per-item error collection; `_BULK_MAX=50`; ID validation on `complete_tasks` (Dom)
+4. **activity-log:** `activity_log` table + indexes; `_log()` helper; per-field old/new tracking in all write paths; `get_task_activity` orphan-safe — no task existence check (Trenton); actor resolution from MCP context
+5. **export-import:** `export_all_tasks` with project-filtered dep subset; `import_tasks` with merge mode; full field validation; single transaction; 5MB cap
+6. **rest-api:** `_build_rest_router()` inner function returning Starlette Router; 7 endpoints (GET/POST /tasks, GET/PATCH/DELETE /tasks/{id}, GET /projects, GET /stats); `--rest-api` CLI flag; `enable_rest` param on `create_server()`; 1MiB body cap (Dom); existence check before activity log in PATCH (Mobley)
+7. **webhooks:** `webhooks` table; `register_webhook` with SSRF guard — IPv4-mapped IPv6 fixed (Dom), `getaddrinfo` in `run_in_executor` (Trenton/Dom); GC-safe `_background_tasks` set (Mobley); task data captured before DELETE for `task.deleted` payload (Mobley); HMAC-SHA256 signing; `httpx` optional dep guarded with ImportError; tag length/count caps (Dom)
+
+**Test count:** 188 tests passing post-implementation (before Romero gap analysis).
+
 ## Learnings

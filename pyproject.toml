@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open-project-manager-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "SQLite-backed project management MCP server for AI agent squads"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,10 +22,14 @@ http = [
     "uvicorn>=0.20",
     "starlette>=0.27",
 ]
+webhooks = [
+    "httpx>=0.24",
+]
 dev = [
     "pytest>=7.0",
     "pytest-mock>=3.0",
     "anyio[trio]>=3.0",
+    "httpx>=0.24",
 ]
 
 [tool.pytest.ini_options]

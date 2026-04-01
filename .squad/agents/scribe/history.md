@@ -44,7 +44,22 @@ Session Logger. I maintain memory, decisions, and logs for the team.
 - Added two new decisions to `.squad/decisions.md`: multi-tenant auth + deployment to skitterphuger
 - Committed all changes: `feat: multi-tenant bearer token auth + deploy to skitterphuger`
 
+### 2026-04-01 — v0.2.0 feature sprint logging session
+
+**Actions taken this session:**
+- Created `.squad/orchestration-log/20260401T024400Z-v0.2.0.md` documenting the full v0.2.0 sprint (Elliot arch, Trenton/Mobley reviews, Darlene impl, coordinator bug fixes, Dom security audit, Romero gap analysis, deployment update)
+- Updated history.md for Elliot (v0.2.0 architecture decisions, 7 features, DNS rebinding open item)
+- Updated history.md for Darlene (7 features implemented, 188 tests)
+- Updated history.md for Romero (+36 tests, 224 total)
+- Updated history.md for Dom (8 security fixes, 1 open item)
+- Replaced stub history.md for Trenton with full entry (hired + schema review, 4 critical catches)
+- Replaced stub history.md for Mobley with full entry (hired + API review, 3 critical catches)
+- Added DNS rebinding OPEN ITEM to `.squad/decisions.md`
+- Marked all 7 v0.2.0 feature tasks as done on the PM server (http://192.168.1.178:8765)
+- Committed all changes: `feat: v0.2.0 — due-dates, FTS, bulk ops, activity log, export/import, REST API, webhooks`
+
 ## Learnings
 
 - Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)
 - Inbox files in `.squad/decisions/inbox/` must be merged into `decisions.md` and then deleted after each session
+- New squad members (Trenton, Mobley) hired as specialists to review before implementation — caught 7 bugs pre-code

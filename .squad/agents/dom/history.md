@@ -36,3 +36,23 @@ Dom was not directly invoked this session. Darlene implemented multi-tenant bear
 - Tokens generated via `secrets.token_hex(32)` — cryptographically secure, 256-bit entropy
 - Missing/malformed Authorization headers return 401 before any tool logic executes
 - Three squads provisioned on skitterphuger; tokens stored chmod 600
+
+### 2026-04-01 — Security audit v0.2.0 — 8 fixes, 1 open item
+
+**Audit scope:** All 7 v0.2.0 features (due-dates, FTS5, bulk-ops, activity-log, export-import, REST API, webhooks).
+
+**Artefact:** `.squad/agents/dom/security-audit-v0.2.0.txt`
+
+**Fixes applied (8):**
+
+1. **IPv4-mapped IPv6 SSRF bypass (HIGH)** — `::ffff:192.168.1.x` format bypassed RFC1918 check. Fixed via `ipaddress.ip_address().ipv4_mapped` normalisation before blocklist check.
+2. **REST body size cap 1MiB (HIGH)** — No limit on POST/PATCH body size. Added 1MiB cap in REST parsing layer.
+3. **`_FixArgumentsMiddleware` 6MB cap (MEDIUM)** — Existing MCP middleware had no body cap. Added 6MB limit.
+4. **FTS5 error message sanitized** — Raw SQLite FTS5 errors leaked internal schema. Now returns generic "search failed" string.
+5. **Tag length cap** — Per-tag character limit added to `create_task` / `update_task`.
+6. **Tag count cap** — Maximum number of tags per task enforced.
+7. **`complete_tasks` ID validation** — Bulk complete now validates each ID format/length before querying.
+8. **REST required-field guards** — POST /tasks hardened to return 400 in all missing-field code paths.
+
+**Open item — DNS rebinding:**
+Registration-time SSRF check only. A low-TTL DNS rebinding attack could pivot a registered HTTPS webhook URL to an internal address after registration. Flagged for Elliot: decision needed — re-validate hostname on each webhook fire vs accept HTTPS certificate validation as sufficient mitigation. Recorded in `.squad/decisions.md`.

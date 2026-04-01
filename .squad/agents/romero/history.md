@@ -45,4 +45,25 @@ The coordinator (GitHub Copilot CLI) wrote the full test suite directly, bypassi
 
 **Result:** 70/70 tests passing.
 
+### 2026-04-01 — Gap analysis + 36 new tests for v0.2.0 (81 → 224 total)
+
+**Task:** Review all 7 v0.2.0 feature implementations for coverage gaps; add missing tests.
+
+**New tests added (+36, 188 → 224):**
+
+Coverage added for:
+- `list_overdue_tasks` / `list_due_soon_tasks` edge cases (no due date set, boundary day, `days` cap enforcement)
+- FTS5 unavailability path (`_fts_available=False` — `search_tasks` returns graceful error)
+- Bulk partial-failure scenarios (mixed valid/invalid items in single call)
+- `get_task_activity` orphan read (activity entries accessible after task deletion)
+- `export_all_tasks` dep-subset filtering (deps excluded when one task is outside project filter)
+- `import_tasks` merge mode (skip existing) and conflict mode (abort with conflict list)
+- REST API auth enforcement (401 on missing/invalid token for all endpoints)
+- REST endpoint coverage (all 7 endpoints: happy path + error cases)
+- Webhook SSRF guard (RFC1918, loopback, IPv4-mapped IPv6)
+- Webhook GC-safe task reference (`_background_tasks` set populated and cleaned)
+- `task.deleted` payload capture (data present in webhook payload despite row being deleted)
+
+**All 224 tests passing.**
+
 ## Learnings

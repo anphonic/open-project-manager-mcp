@@ -10,6 +10,9 @@ import sys
 import platformdirs
 
 
+_MAX_MCP_BODY = 6_000_000  # 6 MB — accommodates the 5 MB import_tasks payload plus overhead
+
+
 class _FixArgumentsMiddleware:
     """Coerce tools/call arguments from [] to {} for non-compliant MCP clients.
 
@@ -27,10 +30,25 @@ class _FixArgumentsMiddleware:
             return
 
         chunks = []
+        total_size = 0
         more_body = True
         while more_body:
             message = await receive()
-            chunks.append(message.get("body", b""))
+            chunk = message.get("body", b"")
+            total_size += len(chunk)
+            if total_size > _MAX_MCP_BODY:
+                await original_send({
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await original_send({
+                    "type": "http.response.body",
+                    "body": b'{"error":"Request body too large"}',
+                    "more_body": False,
+                })
+                return
+            chunks.append(chunk)
             more_body = message.get("more_body", False)
         body = b"".join(chunks)
 
@@ -176,6 +194,12 @@ def main():
         help="Max concurrent connections for HTTP/SSE mode (env: OPM_MAX_CONNECTIONS, default: 100)",
     )
     parser.add_argument(
+        "--rest-api",
+        action="store_true",
+        dest="rest_api",
+        help="Mount REST API at /api/v1 (HTTP mode only). Requires --http.",
+    )
+    parser.add_argument(
         "--generate-token",
         type=str,
         metavar="SQUAD_NAME",
@@ -236,7 +260,7 @@ def main():
         _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
     server_url = f"http://{host}:{port}"
-    mcp = create_server(db_path, tenant_keys=flat_keys, server_url=server_url, transport_security=_transport_security)
+    mcp = create_server(db_path, tenant_keys=flat_keys, server_url=server_url, transport_security=_transport_security, enable_rest=bool(args.rest_api and args.http))
 
     if args.http or args.sse:
         _check_network_auth(host, port, flat_keys, args.allow_unauthenticated_network, "HTTP" if args.http else "SSE")
@@ -265,10 +289,17 @@ def main():
         if args.http:
             print(f"Starting open-project-manager-mcp in HTTP mode on {host}:{port}", file=sys.stderr)
             mcp_asgi = mcp.streamable_http_app()
-            app = Starlette(
-                routes=[Mount("/", mcp_asgi)],
-                lifespan=_make_lifespan(mcp_asgi),
-            )
+            if args.rest_api and hasattr(mcp, "_rest_router"):
+                print("  REST API mounted at /api/v1", file=sys.stderr)
+                app = Starlette(
+                    routes=[Mount("/api/v1", app=mcp._rest_router), Mount("/", mcp_asgi)],
+                    lifespan=_make_lifespan(mcp_asgi),
+                )
+            else:
+                app = Starlette(
+                    routes=[Mount("/", mcp_asgi)],
+                    lifespan=_make_lifespan(mcp_asgi),
+                )
             app = _FixArgumentsMiddleware(app)
         else:
             print(

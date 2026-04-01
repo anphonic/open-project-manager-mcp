@@ -18,6 +18,8 @@
 | Angela | DevRel & Docs | `.squad/agents/angela/charter.md` | 🟢 Active |
 | Scribe | Session Logger | `.squad/agents/scribe/charter.md` | 🟢 Active |
 | Dom | Security Expert | `.squad/agents/dom/charter.md` | 🟢 Active |
+| Trenton | Database & Data Pipeline | `.squad/agents/trenton/charter.md` | 🟢 Active |
+| Mobley | Integration & External Systems | `.squad/agents/mobley/charter.md` | 🟢 Active |
 | Ralph | Work Monitor | — | 🔄 Monitor |
 
 ## Project Context
