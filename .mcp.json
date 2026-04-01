@@ -1,17 +1,19 @@
 {
   "mcpServers": {
     "squad-knowledge": {
+      "type": "stdio",
       "command": "ssh",
+      "tools": ["*"],
       "args": [
         "-i", "C:\\Users\\qbrot\\.ssh\\id_ed25519_skitterphuger",
         "skitterphuger@192.168.1.178",
-        "/home/skitterphuger/mcp/env/bin/python3 /home/skitterphuger/mcp/squad-knowledge/squad_knowledge_mcp.py"
+        "/home/skitterphuger/mcp/env/bin/squad-knowledge-mcp --db-path /home/skitterphuger/mcp/squad-knowledge/chroma_db_new --offline"
       ]
     },
     "open-project-manager": {
       "url": "http://192.168.1.178:8765/mcp",
       "headers": {
-        "Authorization": "Bearer 84jPlPe4gyTTAlmtqWlED9S8OhGMqvJbBgMgwrowSmQ"
+        "Authorization": "Bearer ${env:OPM_BEARER_TOKEN}"
       }
     }
   }

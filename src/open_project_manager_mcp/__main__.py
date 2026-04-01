@@ -244,6 +244,14 @@ def main():
     tenant_keys = _load_tenant_keys()
     flat_keys = {t: v["key"] for t, v in tenant_keys.items()} if tenant_keys else None
 
+    _reg_key = os.environ.get("OPM_REGISTRATION_KEY")
+    if _reg_key is not None and len(_reg_key) < 16:
+        print(
+            "WARNING: OPM_REGISTRATION_KEY is shorter than 16 characters — "
+            "use a longer key in production.",
+            file=sys.stderr,
+        )
+
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     print(f"Database path: {db_path}", file=sys.stderr)
 

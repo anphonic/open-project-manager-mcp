@@ -46,4 +46,24 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 
 **Flagged open item (from Dom's audit):** DNS rebinding — registration-time SSRF check only. Needs decision: re-validate on each fire vs accept HTTPS cert validation as sufficient mitigation.
 
+### 2026-04-01 — Self-service token registration architecture
+
+**Task:** Design `POST /api/v1/register` + `DELETE /api/v1/register/{squad}` — self-service bearer token provisioning extending v0.2.0 REST API.
+
+**Deliverables:**
+- "Self-Service Token Registration" section in `.squad/decisions.md` (10 decisions, summary table)
+- `.squad/agents/elliot/darlene-brief-register.md` — full step-by-step implementation brief for Darlene
+
+**Key decisions:**
+1. **Storage:** `tenant_keys` table (`squad TEXT PK`, `key TEXT NOT NULL`, `created_at TEXT NOT NULL`) appended to `_SCHEMA` — idempotent `CREATE TABLE IF NOT EXISTS`
+2. **Auth lookup:** Re-query DB on every auth call — no cache, no server restart required when new squad registers
+3. **Precedence:** Env var keys first (constant-time); DB keys on miss
+4. **`POST /api/v1/register`:** `404` if `OPM_REGISTRATION_KEY` unset; rate-limited 5/min/IP; squad name `[a-zA-Z0-9_-]{1,64}`; `409` duplicate; `201` + one-time token
+5. **`ApiKeyVerifier` refactored:** Accepts `verify_fn: Callable` — shared `_verify_bearer` closure eliminates duplication between MCP and REST auth paths
+6. **MCP auth scope:** DB-registered keys = REST access only. `if tenant_keys:` guard on `token_verifier`/`auth_settings` preserved — MCP auth requires env var keys
+7. **Plaintext token storage:** Consistent with existing local-first posture
+8. **`DELETE /api/v1/register/{squad}`:** `X-Registration-Key` header; `204` on success
+9. **`--generate-token` CLI:** Unchanged — stdout-only, no DB write
+10. **`OPM_REGISTRATION_KEY` min length:** 16 chars startup warning to stderr
+
 ## Learnings

@@ -67,4 +67,24 @@ The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly
 
 **Test count:** 188 tests passing post-implementation (before Romero gap analysis).
 
+### 2026-04-01 — Self-service token registration implementation
+
+**Task:** Implement `POST /api/v1/register` + `DELETE /api/v1/register/{squad}` per Elliot's brief (`darlene-brief-register.md`).
+
+**Work completed in `server.py` and `__main__.py`:**
+
+- **Schema:** `tenant_keys` table appended to `_SCHEMA` (`CREATE TABLE IF NOT EXISTS` — idempotent, no migration block)
+- **`_verify_bearer` closure:** Defined inside `create_server()` after `_lock`; env var keys first, DB re-queried on every call on miss; shared by both `ApiKeyVerifier` and REST `_check_auth`
+- **`ApiKeyVerifier` refactored:** `__init__` now accepts `verify_fn: Callable` only; class is testable in isolation; `verify_token` delegates entirely to closure
+- **`_check_auth` updated:** Unauthenticated mode (no env keys + empty `tenant_keys` table) still returns `"system"` actor; authenticated path calls `_verify_bearer`
+- **Rate limiter:** `_check_rate_limit(ip)` inside `_build_rest_router()` using `defaultdict(list)` + `time.monotonic()`; `_RATE_WINDOW=60.0`, `_RATE_MAX=5`; no external deps
+- **`_SQUAD_RE`:** `re.compile(r'^[a-zA-Z0-9_-]{1,64}$')` squad name validation
+- **`register_endpoint`:** `POST /register`; reads `OPM_REGISTRATION_KEY` via `os.environ.get`; rate-limited; validates squad name + key; `409` on duplicate; inserts and commits; `201` + `secrets.token_urlsafe(32)` + one-time note
+- **`deregister_endpoint`:** `DELETE /register/{squad}`; key in `X-Registration-Key` header; constant-time compare; `Response(status_code=204)` on success; `404` if not found
+- **Routes added:** `/register` (POST) and `/register/{squad:str}` (DELETE) appended to `_build_rest_router()` route list
+- **`__main__.py`:** `OPM_REGISTRATION_KEY` length warning — warns to stderr if set but < 16 chars
+- **New imports added to `server.py`:** `import os`, `import re`, `import secrets`, `import time`, `from collections import defaultdict`
+
+**Tests:** 26 new tests in `tests/test_registration.py` → **250 total** (all passing). Covers: 404 disabled, 401 wrong key, 400 invalid squad, 201 success + DB row, 409 duplicate, 429 rate limit, 401/404/204 deregister paths, DB token in `_check_auth`, env var precedence, unauthenticated mode, startup warning.
+
 ## Learnings

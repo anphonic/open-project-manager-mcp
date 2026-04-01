@@ -5,8 +5,13 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
+import re
+import secrets
 import socket
 import sqlite3
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -17,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.authentication import AuthenticationError
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, Router
 
 VALID_PRIORITIES = {"critical", "high", "medium", "low"}
@@ -55,23 +60,19 @@ _SSRF_BLOCKED_NETWORKS = [
 
 
 class ApiKeyVerifier(TokenVerifier):
-    """Validates Bearer API keys and injects tenant_id into token claims."""
+    """Validates Bearer API keys; checks env var keys then DB-registered keys."""
 
-    def __init__(self, tenant_keys: dict[str, str]):
-        self._tenants: list[tuple[str, str]] = list(tenant_keys.items())
+    def __init__(self, verify_fn):
+        self._verify = verify_fn
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            matched_tenant = None
-            for tenant_id, api_key in self._tenants:
-                if hmac.compare_digest(token, api_key):
-                    matched_tenant = tenant_id
-                    break
-            if not matched_tenant:
+            tenant_id = self._verify(token)
+            if not tenant_id:
                 raise AuthenticationError("Invalid API key")
             return AccessToken(
                 token=token,
-                client_id=matched_tenant,
+                client_id=tenant_id,
                 scopes=["api"],
             )
         except AuthenticationError:
@@ -124,6 +125,12 @@ CREATE TABLE IF NOT EXISTS webhooks (
     secret     TEXT,
     enabled    INTEGER NOT NULL DEFAULT 1,
     created_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tenant_keys (
+    squad      TEXT PRIMARY KEY,
+    key        TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -188,10 +195,28 @@ def create_server(
 
     _lock = asyncio.Lock()
 
+    def _verify_bearer(token: str) -> str | None:
+        """Return tenant_id if token is valid, else None. Env var keys take precedence."""
+        # 1. Env var keys — checked first
+        if tenant_keys:
+            for tid, key in tenant_keys.items():
+                if hmac.compare_digest(token, key):
+                    return tid
+        # 2. DB-registered keys — re-queried on every call (no restart needed)
+        # Note: DB keys grant REST API access only; MCP access requires OPM_TENANT_KEYS.
+        try:
+            rows = conn.execute("SELECT squad, key FROM tenant_keys").fetchall()
+        except sqlite3.Error:
+            return None
+        for row in rows:
+            if hmac.compare_digest(token, row["key"]):
+                return row["squad"]
+        return None
+
     auth_settings = None
     token_verifier = None
     if tenant_keys:
-        token_verifier = ApiKeyVerifier(tenant_keys)
+        token_verifier = ApiKeyVerifier(_verify_bearer)
         auth_settings = AuthSettings(
             issuer_url=server_url,
             resource_server_url=server_url,
@@ -1334,15 +1359,25 @@ def create_server(
 
             async def _check_auth(request: Request):
                 """Returns (actor, None) on success or (None, JSONResponse) on failure."""
-                if not tenant_keys:
-                    return "system", None
+                # Unauthenticated mode: no env var keys AND tenant_keys table is empty AND
+                # OPM_REGISTRATION_KEY is not set.  If the registration key IS set the admin
+                # clearly intends auth to be required — an empty DB means "no valid tokens yet",
+                # not "open to everyone".
+                if not tenant_keys and not os.environ.get("OPM_REGISTRATION_KEY"):
+                    try:
+                        has_db_keys = bool(conn.execute("SELECT 1 FROM tenant_keys LIMIT 1").fetchone())
+                    except sqlite3.Error:
+                        has_db_keys = False
+                    if not has_db_keys:
+                        return "system", None
+
                 auth_header = request.headers.get("Authorization", "")
                 if not auth_header.startswith("Bearer "):
                     return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
                 token = auth_header[7:]
-                for tid, key in tenant_keys.items():
-                    if hmac.compare_digest(token, key):
-                        return tid, None
+                tenant_id = _verify_bearer(token)
+                if tenant_id:
+                    return tenant_id, None
                 return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
 
             def _error_status(msg: str) -> int:
@@ -1590,11 +1625,128 @@ def create_server(
                     "oldest_open": oldest["oldest"] if oldest else None,
                 })
 
+            # ------------------------------------------------------------------
+            # Registration rate limiter (in-memory, resets on restart)
+            # ------------------------------------------------------------------
+            _reg_attempts: dict[str, list[float]] = defaultdict(list)
+            _RATE_WINDOW = 60.0
+            _RATE_MAX = 5
+            _SQUAD_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+            def _check_rate_limit(ip: str) -> bool:
+                """Return True if request is allowed, False if rate limit exceeded."""
+                now = time.monotonic()
+                # Opportunistic eviction: purge IPs whose entire window has expired so the
+                # dict doesn't grow without bound under a flood of unique source IPs.
+                stale_keys = [k for k, v in _reg_attempts.items() if not v or now - v[-1] >= _RATE_WINDOW]
+                for k in stale_keys:
+                    del _reg_attempts[k]
+                unexpired = [t for t in _reg_attempts[ip] if now - t < _RATE_WINDOW]
+                if len(unexpired) >= _RATE_MAX:
+                    _reg_attempts[ip] = unexpired
+                    return False
+                unexpired.append(now)
+                _reg_attempts[ip] = unexpired
+                return True
+
+            async def register_endpoint(request: Request) -> JSONResponse:
+                registration_key = os.environ.get("OPM_REGISTRATION_KEY")
+                if not registration_key:
+                    return JSONResponse({"error": "Not Found"}, status_code=404)
+
+                client_ip = request.client.host if request.client else "unknown"
+                if not _check_rate_limit(client_ip):
+                    return JSONResponse(
+                        {"error": "Too many registration attempts. Try again later."},
+                        status_code=429,
+                    )
+
+                body, err = await _read_json_body(request)
+                if err:
+                    return err
+
+                squad = body.get("squad") if isinstance(body, dict) else None
+                provided_key = body.get("registration_key") if isinstance(body, dict) else None
+
+                if not isinstance(provided_key, str) or not hmac.compare_digest(provided_key, registration_key):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+                if not isinstance(squad, str) or not _SQUAD_RE.match(squad):
+                    return JSONResponse(
+                        {"error": "Invalid squad name. Must be 1–64 characters: letters, digits, hyphens, underscores."},
+                        status_code=400,
+                    )
+
+                try:
+                    existing = conn.execute(
+                        "SELECT squad FROM tenant_keys WHERE squad = ?", (squad,)
+                    ).fetchone()
+                    if existing:
+                        return JSONResponse(
+                            {"error": f"Squad '{squad}' is already registered."},
+                            status_code=409,
+                        )
+                    token = secrets.token_urlsafe(32)
+                    conn.execute(
+                        "INSERT INTO tenant_keys (squad, key, created_at) VALUES (?, ?, ?)",
+                        (squad, token, _now()),
+                    )
+                    conn.commit()
+                except sqlite3.Error:
+                    return JSONResponse({"error": "Error: database error"}, status_code=500)
+
+                return JSONResponse(
+                    {
+                        "squad": squad,
+                        "token": token,
+                        "note": (
+                            "Store this token — it will not be shown again. "
+                            "Use it as a Bearer token in the Authorization header. "
+                            "This token grants REST API access only; for MCP access, "
+                            "ask your admin to add the squad to OPM_TENANT_KEYS."
+                        ),
+                    },
+                    status_code=201,
+                )
+
+            async def deregister_endpoint(request: Request) -> Response:
+                registration_key = os.environ.get("OPM_REGISTRATION_KEY")
+                if not registration_key:
+                    return JSONResponse({"error": "Not Found"}, status_code=404)
+
+                reg_key_header = request.headers.get("X-Registration-Key", "")
+                if not reg_key_header or not hmac.compare_digest(reg_key_header, registration_key):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+                squad = request.path_params["squad"]
+
+                if not _SQUAD_RE.match(squad):
+                    return JSONResponse(
+                        {"error": "Invalid squad name. Must be 1–64 characters: letters, digits, hyphens, underscores."},
+                        status_code=400,
+                    )
+
+                try:
+                    result = conn.execute(
+                        "DELETE FROM tenant_keys WHERE squad = ?", (squad,)
+                    )
+                    conn.commit()
+                    if result.rowcount == 0:
+                        return JSONResponse(
+                            {"error": f"Squad '{squad}' not found."}, status_code=404
+                        )
+                except sqlite3.Error:
+                    return JSONResponse({"error": "Error: database error"}, status_code=500)
+
+                return Response(status_code=204)
+
             return Router(routes=[
                 Route("/tasks", endpoint=tasks_endpoint, methods=["GET", "POST"]),
                 Route("/tasks/{id:str}", endpoint=task_endpoint, methods=["GET", "PATCH", "DELETE"]),
                 Route("/projects", endpoint=projects_endpoint, methods=["GET"]),
                 Route("/stats", endpoint=stats_endpoint, methods=["GET"]),
+                Route("/register", endpoint=register_endpoint, methods=["POST"]),
+                Route("/register/{squad:str}", endpoint=deregister_endpoint, methods=["DELETE"]),
             ])
 
         mcp._rest_router = _build_rest_router()

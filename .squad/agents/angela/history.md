@@ -37,4 +37,17 @@ The coordinator (GitHub Copilot CLI) wrote all packaging and documentation direc
 
 **No code changes this session.**
 
+### 2026-04-01 — Knowledge board update (registration feature)
+
+**Task:** Post registration feature knowledge entries to squad-knowledge server.
+
+**Actions taken:**
+- Posted 4 entries to squad-knowledge server (topic: `mcp-infrastructure`):
+  1. Self-service token registration — feature overview and endpoint summary (`POST /api/v1/register`, `DELETE /api/v1/register/{squad}`)
+  2. `tenant_keys` schema and auth lookup flow (env var precedence, DB re-query on every call)
+  3. `OPM_REGISTRATION_KEY` configuration and rate limiting (5/min/IP, startup warning)
+  4. Token revocation pattern (`DELETE` + `X-Registration-Key` header)
+
+**No code changes this session.**
+
 ## Learnings

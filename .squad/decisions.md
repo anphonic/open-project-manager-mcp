@@ -379,3 +379,129 @@ Dedicated `ralph` bearer token provisioned. MCP config updated in both squad rep
 | 5 | export-import | Logic-only; needs due-dates in schema |
 | 6 | rest-api | Largest surface area change; all tools must be stable first |
 | 7 | webhooks | New dep; most risk; isolated last |
+
+---
+
+## 2026-04-01: Self-service token registration
+
+**Scope:** `POST /api/v1/register` + `DELETE /api/v1/register/{squad}` — remote squads self-provision bearer tokens using a shared registration key set by the admin.
+
+---
+
+### 1. Token storage — SQLite `tenant_keys` table
+
+**Decision:** Store registered tokens in a new `tenant_keys` table in the same SQLite DB used for tasks.
+
+**Rationale:** Fits the existing pattern (SQLite for all persistent state). Transactional — no file I/O races. No new infrastructure. Idempotent `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` (or appended migration block) keeps startup clean.
+
+**DDL:**
+```sql
+CREATE TABLE IF NOT EXISTS tenant_keys (
+    squad       TEXT PRIMARY KEY,
+    key         TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+```
+
+---
+
+### 2. Key loading strategy — re-query DB on every auth check
+
+**Decision:** Both `ApiKeyVerifier.verify_token()` (MCP auth) and `_check_auth()` (REST auth) query `SELECT squad, key FROM tenant_keys` on every request — no in-memory cache, no TTL.
+
+**Rationale:** LAN server, negligible SQLite read latency. Eliminates the "restart to pick up new keys" problem entirely. Consistent with the existing sync `conn.execute()` pattern used throughout all tool handlers (`check_same_thread=False` already set). Cache invalidation complexity is not worth it at this scale.
+
+---
+
+### 3. Auth source precedence — env var keys win
+
+**Decision:** Env var keys (`OPM_TENANT_KEYS`) are checked first. DB-registered keys supplement if no env var match is found.
+
+**Rationale:** Admin can always override a self-registered squad by adding the same squad name to `OPM_TENANT_KEYS`, which takes precedence. Allows revocation without deleting the DB row: just add an env var override that never matches a real token.
+
+**Implementation:** Extract a shared helper `_verify_bearer(token: str) -> str | None` as an inner function in `create_server()`. Checks env var dict first, then DB. Used by both `ApiKeyVerifier` and `_check_auth`.
+
+---
+
+### 4. `POST /api/v1/register` endpoint contract
+
+**Decision:** Endpoint exists only when `--rest-api` and `--http` flags are active AND `OPM_REGISTRATION_KEY` env var is set. If `OPM_REGISTRATION_KEY` is absent, endpoint returns `404` — feature disabled, surface area minimized.
+
+```
+POST /api/v1/register
+Body: {"squad": "myteam", "registration_key": "..."}
+
+201 → {"squad": "myteam", "token": "...", "note": "Store this token — it will not be shown again."}
+400 → squad name invalid (must match [a-zA-Z0-9_-]{1,64})
+401 → registration_key wrong
+404 → registration disabled (OPM_REGISTRATION_KEY not set)
+409 → squad already registered
+429 → rate limit exceeded
+```
+
+Token generated with `secrets.token_urlsafe(32)` — consistent with `--generate-token` CLI.
+
+---
+
+### 5. `OPM_REGISTRATION_KEY` — minimum length enforcement
+
+**Decision:** Minimum 16 characters. Checked at startup (`main()` in `__main__.py`). Print a `WARNING:` to stderr if shorter; do NOT exit (admin may have a reason). The endpoint itself does NOT enforce the minimum at request time — that would leak information. Startup warning is sufficient.
+
+---
+
+### 6. Rate limiting — in-memory per-IP counter
+
+**Decision:** Simple in-memory structure: `dict[str, list[float]]` mapping client IP → list of attempt timestamps. Window: 60 seconds. Max: 5 attempts per window. Returns `429` on exceed.
+
+**Rationale:** No external deps. Fits LAN threat model — no legitimate squad needs more than 5 registration attempts per minute. Reset on server restart (acceptable; rate limiting is a nuisance brake, not a hard security gate here).
+
+**Client IP:** `request.client.host` only — do NOT trust `X-Forwarded-For` (no reverse proxy requirement, and trusting that header would allow bypass).
+
+---
+
+### 7. Token plaintext vs. hashed storage
+
+**Decision:** Store tokens **plaintext** in the `tenant_keys` table.
+
+**Rationale:** Consistent with the existing security posture — env var `OPM_TENANT_KEYS` stores tokens in plaintext, `--generate-token` prints the token in plaintext, and webhook `secret` fields are stored plaintext ("acceptable for local-first" per v0.2.0 webhooks decision). The DB lives on the same host as the server. If an attacker has read access to the SQLite file, they already have full access to the task data — the actual sensitive asset. SHA-256 hashing would add implementation complexity (and a SHA-256 of a 32-byte random token is not meaningfully more secure than the token itself in this threat model). Do NOT use bcrypt — there is no password stretching needed for high-entropy random tokens.
+
+---
+
+### 8. `DELETE /api/v1/register/{squad}` — token revocation
+
+**Decision:** Implement `DELETE /api/v1/register/{squad}`. Protected by `OPM_REGISTRATION_KEY`, passed in `X-Registration-Key` request header (no body on DELETE). Returns `204` on success, `404` if squad not found.
+
+**Rationale:** Admin must be able to revoke a self-registered token without restarting the server. Using a header rather than a request body is conventional for DELETE. Using the same `OPM_REGISTRATION_KEY` keeps the admin surface consistent.
+
+---
+
+### 9. `--generate-token` CLI — remains stdout-only
+
+**Decision:** `--generate-token SQUAD_NAME` continues to print the token to stdout and exit. It does NOT write to the DB.
+
+**Rationale:** Admin workflow is intentionally separate from self-service workflow. Keeping `--generate-token` stdout-only means it can be used before the server is started (no DB open). DB is exclusively for self-service registrations.
+
+---
+
+### 10. `ApiKeyVerifier` — pass `conn` to enable DB lookup
+
+**Decision:** `ApiKeyVerifier.__init__` gains a second parameter `conn: sqlite3.Connection`. The existing `tenant_keys` dict (env var keys) stays as the first check. DB is queried on cache-miss.
+
+**Rationale:** Minimal change to the existing class. `conn` is already available inside `create_server()` when the verifier is instantiated.
+
+---
+
+### Summary table
+
+| # | Decision |
+|---|----------|
+| 1 | Token storage: SQLite `tenant_keys` table (same DB, `CREATE TABLE IF NOT EXISTS`) |
+| 2 | Key loading: re-query DB on every auth check — no cache, no restart needed |
+| 3 | Precedence: env var keys first, DB keys supplement |
+| 4 | `POST /api/v1/register` — 404 if `OPM_REGISTRATION_KEY` unset; 409 on duplicate squad |
+| 5 | `OPM_REGISTRATION_KEY` min length: 16 chars, startup WARNING only (no hard exit) |
+| 6 | Rate limiting: in-memory per-IP, 5/min, 429 on exceed, no external deps |
+| 7 | Token storage format: **plaintext** — consistent with existing local-first posture |
+| 8 | `DELETE /api/v1/register/{squad}` — revocation via `X-Registration-Key` header |
+| 9 | `--generate-token` stays stdout-only; DB is self-service only |
+| 10 | `ApiKeyVerifier` gains `conn` parameter; shared `_verify_bearer()` inner helper |

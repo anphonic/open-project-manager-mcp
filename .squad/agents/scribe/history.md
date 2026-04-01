@@ -58,6 +58,17 @@ Session Logger. I maintain memory, decisions, and logs for the team.
 - Marked all 7 v0.2.0 feature tasks as done on the PM server (http://192.168.1.178:8765)
 - Committed all changes: `feat: v0.2.0 — due-dates, FTS, bulk ops, activity log, export/import, REST API, webhooks`
 
+### 2026-04-01 — Registration feature logging session
+
+**Actions taken this session:**
+- Created `.squad/orchestration-log/20260401T220000Z-registration.md` documenting Elliot's architecture, Darlene's implementation, Dom's in-progress audit, and Angela's knowledge board posts
+- Updated history.md for Elliot (registration architecture, 10 decisions, `darlene-brief-register.md`)
+- Updated history.md for Darlene (registration impl, `ApiKeyVerifier` refactor, `_verify_bearer`, rate limiter, 26 new tests, 250 total)
+- Updated history.md for Angela (4 knowledge board entries, topic: mcp-infrastructure)
+- Updated history.md for Scribe (this entry)
+- PM server board noted: `self-service-registration` remains `in_progress` — Dom audit pending; `backward-compat`, `github-issues-sync`, `scribe-pm-logging` tasks logged
+- **No git commit** — awaiting Dom security audit completion
+
 ## Learnings
 
 - Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)
