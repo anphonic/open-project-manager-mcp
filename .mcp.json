@@ -11,6 +11,7 @@
       ]
     },
     "open-project-manager": {
+      "type": "http",
       "url": "http://192.168.1.178:8765/mcp",
       "headers": {
         "Authorization": "Bearer ${env:OPM_BEARER_TOKEN}"
