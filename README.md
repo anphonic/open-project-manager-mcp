@@ -146,6 +146,172 @@ Tokens are validated with constant-time comparison. Transmit over TLS in product
 
 ---
 
+## Server Setup
+
+Complete first-time admin bootstrap for a shared HTTP server.
+
+### Step 1 — Install
+
+```bash
+pip install 'open-project-manager-mcp[http]'
+```
+
+### Step 2 — Generate an admin token
+
+```bash
+open-project-manager-mcp --generate-token admin
+```
+
+Save the output token — it won't be shown again.
+
+### Step 3 — Configure environment
+
+**Linux / macOS (`start.sh`)**
+
+```bash
+#!/usr/bin/env bash
+export OPM_TENANT_KEYS='{"admin":{"key":"<admin-token>"}}'
+
+# Optional: set this to let remote squads self-register via POST /api/v1/register.
+# Omit to manually issue all tokens.
+export OPM_REGISTRATION_KEY='<registration-secret>'
+
+export OPM_DB_PATH='/var/data/opm/opm.db'
+
+exec open-project-manager-mcp --http --rest-api --host 0.0.0.0 --port 8765
+```
+
+```bash
+chmod 600 start.sh   # contains secrets — restrict permissions
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$env:OPM_TENANT_KEYS = '{"admin":{"key":"<admin-token>"}}'
+$env:OPM_REGISTRATION_KEY = '<registration-secret>'
+$env:OPM_DB_PATH = 'C:\data\opm\opm.db'
+
+open-project-manager-mcp --http --rest-api --host 0.0.0.0 --port 8765
+```
+
+### Step 4 — Start the server
+
+```bash
+./start.sh
+```
+
+Verify it's running:
+
+```bash
+# Should return 401
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/mcp
+
+# Should return 200 (or MCP handshake response)
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/mcp \
+  -H "Authorization: Bearer <admin-token>"
+```
+
+PowerShell equivalent:
+
+```powershell
+# Should return 401
+(Invoke-WebRequest http://localhost:8765/mcp -SkipHttpErrorCheck).StatusCode
+
+# Should return 200
+(Invoke-WebRequest http://localhost:8765/mcp `
+  -Headers @{ Authorization = "Bearer <admin-token>" } `
+  -SkipHttpErrorCheck).StatusCode
+```
+
+> **Unauthenticated mode:** If neither `OPM_TENANT_KEYS` nor `OPM_REGISTRATION_KEY` is set, the server runs without auth. Suitable for local stdio use only — do not expose on a network.
+
+---
+
+## Client / MCP Setup
+
+How connecting clients (squad members, AI tools) get a token and configure their MCP client.
+
+### Option A — Admin-issued token
+
+The admin generates a token and adds it to `OPM_TENANT_KEYS`, then restarts the server:
+
+```bash
+open-project-manager-mcp --generate-token my-team
+# Add {"my-team": {"key": "<token>"}} to OPM_TENANT_KEYS and restart
+```
+
+Share the token out of band.
+
+### Option B — Self-service registration
+
+Requires `OPM_REGISTRATION_KEY` to be set and `--rest-api` to be active.
+
+```bash
+curl -X POST http://<host>:8765/api/v1/register \
+  -H "Authorization: Bearer <OPM_REGISTRATION_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"squad": "my-team"}'
+```
+
+Returns `{"squad": "my-team", "token": "<generated>"}`. Save the token — rate-limited to 5 req/min per IP.
+
+### Setting `OPM_BEARER_TOKEN`
+
+**Windows** (persistent, all apps):
+
+```cmd
+setx OPM_BEARER_TOKEN "your-token-here"
+```
+
+Restart any running tools to pick it up.
+
+**macOS** (persistent, all terminal-launched tools):
+
+```bash
+echo 'export OPM_BEARER_TOKEN="your-token-here"' >> ~/.zshenv
+```
+
+For GUI-launched apps (e.g. Claude Desktop), also run:
+
+```bash
+launchctl setenv OPM_BEARER_TOKEN "your-token-here"
+```
+
+This resets on reboot; add to a LaunchAgent plist for persistence.
+
+**Linux** (persistent, all apps via systemd user session):
+
+```bash
+mkdir -p ~/.config/environment.d
+echo 'OPM_BEARER_TOKEN=your-token-here' >> ~/.config/environment.d/mcp-tokens.conf
+```
+
+For non-systemd / terminal only, add to `~/.profile`:
+
+```bash
+export OPM_BEARER_TOKEN="your-token-here"
+```
+
+### MCP config
+
+`${env:OPM_BEARER_TOKEN}` is resolved by the MCP client — the same snippet works on all platforms:
+
+```json
+{
+  "mcpServers": {
+    "open-project-manager": {
+      "url": "http://<host>:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:OPM_BEARER_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+---
+
 ## REST API
 
 Enable alongside the MCP endpoint with `--rest-api` (requires `--http`):
@@ -261,6 +427,7 @@ register_webhook(
 | `--max-connections` | `OPM_MAX_CONNECTIONS` | `100` | HTTP/SSE concurrency cap |
 | `--rest-api` | — | off | Mount REST API at `/api/v1` (requires `--http`) |
 | — | `OPM_TENANT_KEYS` | unset | JSON object of bearer tokens: `{"squad": {"key": "token"}}` |
+| — | `OPM_REGISTRATION_KEY` | unset | Shared secret for `POST /api/v1/register` self-service token registration. If unset, registration endpoint returns 404. Requires `--rest-api`. |
 
 ## Development
 
