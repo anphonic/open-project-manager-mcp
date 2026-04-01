@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open-project-manager-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "SQLite-backed project management MCP server for AI agent squads"
 readme = "README.md"
 license = { text = "MIT" }
