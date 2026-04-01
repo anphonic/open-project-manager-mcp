@@ -249,9 +249,8 @@ Requires `OPM_REGISTRATION_KEY` to be set and `--rest-api` to be active.
 
 ```bash
 curl -X POST http://<host>:8765/api/v1/register \
-  -H "Authorization: Bearer <OPM_REGISTRATION_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"squad": "my-team"}'
+  -d '{"squad": "my-team", "registration_key": "<OPM_REGISTRATION_KEY>"}'
 ```
 
 Returns `{"squad": "my-team", "token": "<generated>"}`. Save the token — rate-limited to 5 req/min per IP.
