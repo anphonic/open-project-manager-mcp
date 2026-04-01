@@ -390,7 +390,7 @@ def create_server(
                 ).hexdigest()
                 headers["X-Hub-Signature-256"] = f"sha256={sig}"
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                async with httpx.AsyncClient(timeout=5.0, verify=True) as client:
                     await client.post(row["url"], content=payload_bytes, headers=headers)
             except Exception:
                 pass  # fire-and-forget; no retries in v0.2.0

@@ -207,8 +207,7 @@ Fix applied:
 ITEMS NOT FIXED (addressed by design or need Elliot's review)
 ================================================================================
 
-1. DNS rebinding (ISSUE 3 above) — registraton-time check only.
-   Recommend: re-validate on each webhook delivery. Decision for Elliot.
+1. DNS rebinding (ISSUE 3 above) — CLOSED 2026-04-01: Elliot decision: keep registration-time check only; httpx verify=True now explicit; HTTPS/TLS cert validation is the practical mitigation.
 
 2. FTS5 query power-user behavior — FTS5 accepts boolean operators, column
    filters, and phrase queries through the MATCH ? parameterized binding.

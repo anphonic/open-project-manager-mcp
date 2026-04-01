@@ -342,7 +342,13 @@ delete_webhook(id: str, human_approval: bool = False) -> str
 
 ---
 
-## OPEN ITEM 2026-04-01: Webhook SSRF — DNS rebinding
+## 2026-04-01: Webhook SSRF — DNS rebinding resolution
+
+**Decision:** Keep registration-time SSRF check only. Rely on HTTPS + TLS cert verification as primary mitigation (httpx `verify=True` explicit). DNS rebinding requires a valid TLS cert for the attacker's domain on the internal target — not practically exploitable. Per-fire DNS re-validation rejected: adds latency, availability risk, doesn't close TOCTOU window.
+
+---
+
+## CLOSED ITEM 2026-04-01: Webhook SSRF — DNS rebinding
 
 **Flagged by:** Dom (security audit v0.2.0)  
 **Status:** Open — needs Elliot decision  
@@ -354,6 +360,13 @@ delete_webhook(id: str, human_approval: bool = False) -> str
 2. **Accept HTTPS cert validation as mitigation** — internal services typically don't have valid public TLS certificates; an invalid cert would cause `httpx` to reject the connection. Lower operational cost; not a complete mitigation (attacker with a wildcard cert or internal CA defeats it).
 
 **Needs Elliot decision.**
+
+## 2026-04-01: Ralph integrated with OPM
+
+Ralph now checks list_ready_tasks first, then GitHub Issues as fallback.
+Dedicated `ralph` bearer token provisioned. MCP config updated in both squad repos.
+
+---
 
 ### Build order summary
 
