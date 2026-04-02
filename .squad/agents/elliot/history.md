@@ -118,3 +118,59 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 **Architecture decision merged to `.squad/decisions.md`:** Full OPM Transport Stability entry (94 lines) with problem statement, options evaluated, chosen approach, implementation plan, success criteria, and future considerations.
 
 **Mobley findings:** REST API gap in SSE mode identified; recommended as defensive fix even if staying with HTTP mode.
+
+### 2026-04-02 — Proactive messaging system architecture
+
+**Task:** Design architecture for bidirectional proactive messaging per Andrew's request.
+
+**Deliverable:** `.squad/decisions/inbox/elliot-messaging-arch.md`
+
+**Key decisions:**
+1. **Extends webhooks, doesn't replace:** Existing webhook system for task events remains; proactive messaging adds server state events and inbound team status.
+2. **Three phases:** (1a) Server state query tools, (1b) Event subscription system, (2) Inbound team status/events.
+3. **New tables:** `event_subscriptions` for outbound subscriptions; `team_status` + `team_events` for inbound (Phase 2).
+4. **Build order:** 8 (query tools), 9 (subscriptions), 10 (inbound status) — all after v0.2.0 webhooks.
+5. **Deferred SSE:** Real-time SSE stream deferred to Phase 3; webhooks + polling sufficient for now given transport stability concerns.
+
+**Open questions for Andrew:**
+- Periodic interval defaults (60s min, 86400s max?)
+- Team status semantics (auto-reassign tasks when offline?)
+- Event retention policy (30 days default?)
+- SSE priority
+
+## Learnings
+
+### Proactive messaging design patterns
+- Separate tables for different event delivery semantics (periodic vs on-change)
+- Reuse SSRF validation and HMAC signing infrastructure from webhooks
+- Inbound team status enables coordination visibility without polling
+- SSE introduces transport stability risks — prefer webhooks for reliability
+
+### 2026-04-02 — Messaging architecture reconciliation + Darlene brief
+
+**Task:** Reconcile Elliot + Mobley messaging designs; incorporate Andrew's 7 decisions; produce Darlene implementation brief.
+
+**Andrew's decisions:**
+1. **Cross-team visibility:** ALL authenticated teams see all events (any team can see all teams' notifications/status via SSE).
+2. **Internal webhooks:** SSE-ONLY for internal coordination — keep webhooks HTTPS-only; NO http:// LAN targets (Mobley's §4 LAN webhook split rejected).
+3. **Offline status semantics:** INFORMATIONAL ONLY in v0.2.0 — no automatic task reassignment.
+4. **SSE priority:** YES — implement SSE in v0.2.0. `ConnectionTimeoutMiddleware` from recent transport-stability commit resolved transport concerns.
+5. **Notification persistence:** Ephemeral in v0.2.0. `notifications` table deferred to v0.3.0.
+6. **Interval defaults:** 30s for `server.health` events; 60s minimum / 86400s cap for `server.stats` subscriptions.
+7. **Event retention:** 30-day pruning for `team_events` — schema has `created_at` index ready; prune job deferred to v0.3.0.
+
+**Key reconciliation decisions:**
+- **SSE promoted from Phase 3 → Build Order 8.** Was deferred due to transport stability; now unblocked.
+- **Mobley's SSE endpoint accepted** (`GET /api/v1/events`). Mobley's internal webhook split rejected; HTTPS-only enforced for all outbound.
+- **Naming collision resolved:** `GET /api/v1/events` = SSE stream; `POST /api/v1/events` = team event push; `GET /api/v1/team-events` = REST list.
+- **Notification vs team event distinction:** `POST /api/v1/notifications` = ephemeral broadcast (no DB storage); `POST /api/v1/events` = persisted in `team_events`.
+- **Build order revised:** 8=SSE+state query, 9=team inbound+notifications, 10=outbound subscriptions.
+- **Elliot's `event_subscriptions` table preserved** from original design for Build Order 10.
+
+**Deliverable:** `.squad/agents/elliot/darlene-brief-messaging.md`
+
+**New tables approved:** `team_status`, `team_events`, `event_subscriptions`
+
+**New MCP tools:** `get_server_stats`, `get_project_summary`, `set_team_status`, `get_team_status`, `post_team_event`, `get_team_events`, `subscribe_events`, `list_subscriptions`, `unsubscribe_events`
+
+**Security review flagged for Dom:** notification payload XSS risk (data field broadcast to SSE clients), squad identity spoofing in POST /notifications (intentional, informational), rate limiting deferred to v0.3.0.

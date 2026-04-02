@@ -643,3 +643,296 @@ Token generated with `secrets.token_urlsafe(32)` — consistent with `--generate
 | 8 | `DELETE /api/v1/register/{squad}` — revocation via `X-Registration-Key` header |
 | 9 | `--generate-token` stays stdout-only; DB is self-service only |
 | 10 | `ApiKeyVerifier` gains `conn` parameter; shared `_verify_bearer()` inner helper |
+
+
+---
+
+## Mobley — Proactive Messaging Protocol Design (2026-04-02)
+
+**Author:** Mobley (Integration & External Systems Specialist)
+**Date:** 2026-04-02
+**Request:** Andrew (proactive messaging for server state updates — push + pull, bidirectional)
+**Context:** Parallel work with Elliot (architecture). This document covers HTTP/protocol layer.
+
+### Executive Summary
+
+The existing v0.2.0 scope includes:
+- **Webhooks** (build order 7, not implemented): OPM→teams unidirectional push for task events
+- **REST API** (implemented): Teams→OPM GET/POST for task CRUD
+- **Activity log** (designed, not implemented): Full audit trail
+
+Andrew wants **bidirectional proactive messaging** — server state updates pushed AND pulled in both directions.
+
+This design adds **three new REST endpoints** and proposes **splitting the webhook system** into external (HTTPS-only, SSRF-guarded) vs internal (LAN-only, relaxed for registered team endpoints).
+
+### Design Principles
+
+1. **Authentication:** Same Bearer token mechanism (Authorization: Bearer <token>) validated by ApiKeyVerifier against OPM_TENANT_KEYS. No new auth system.
+2. **Transport independence:** All endpoints work in both --http and --sse modes (REST API now correctly mounts in both).
+3. **No new dependencies:** Use stdlib + existing Starlette/FastMCP primitives. SSE streaming uses starlette.responses.StreamingResponse.
+4. **Simplicity over perfection:** v0.2.0 is "local-first, single-tenant." No distributed systems complexity. No persistent message queues (SQLite-backed deferred to v0.3.0).
+5. **Coordinate with Elliot:** This is the protocol/integration layer. Elliot owns the event schema and state model.
+
+### 1. SSE Event Stream Endpoint
+
+#### `GET /api/v1/events`
+
+**Purpose:** Teams connect and receive real-time server state updates as they occur.
+**Authentication:** Bearer token required.
+**Response:** Content-Type: text/event-stream
+
+**Event types:**
+1. 	ask.created, 	ask.updated, 	ask.completed, 	ask.deleted
+2. server.health — emitted every 30s
+3. queue.stats — emitted on significant changes
+4. ctivity.logged — future, if activity log implemented
+
+**Connection management:**
+- Inherit ConnectionTimeoutMiddleware limits (idle_timeout=180)
+- Include Retry-After: 5 on 503 if overloaded
+- Client MUST send comment heartbeats or reconnect on disconnect
+
+**Webhooks vs SSE:** Webhooks = server-initiated push (HTTPS, registration required). SSE = client-initiated pull-stream (any authenticated client, no registration).
+
+**Implementation:** syncio.Queue event bus; write operations publish events; SSE endpoint consumes with per-client queue copy.
+
+### 2. Team Notification Inbox
+
+#### `POST /api/v1/notifications`
+
+**Purpose:** Teams proactively push status updates TO OPM (reverse direction).
+
+**Message types:** squad.status, squad.alert, squad.heartbeat
+
+**Response:** 201 Created with {"notification_id": "<uuid>", "received_at": "<timestamp>"}
+
+**Storage:** Ephemeral in v0.2.0 (no SQLite). Notifications broadcast to SSE clients as 
+otification.received. SQLite 
+otifications table deferred to v0.3.0.
+
+#### `GET /api/v1/notifications`
+
+**Purpose:** Retrieve recent notifications. Returns empty array in v0.2.0 (stub for API contract).
+
+### 3. State Snapshot
+
+**Decision:** Extend existing GET /api/v1/stats with ?detailed=true query param rather than new /state endpoint (avoid endpoint proliferation).
+
+- GET /api/v1/stats (default): existing lightweight response (task counts + uptime)
+- GET /api/v1/stats?detailed=true: comprehensive snapshot — server info, per-project task breakdowns, webhook counts, activity timestamps, active SSE client count
+
+### 4. Webhook System Split (Internal vs External)
+
+**Proposed:**
+- **External webhooks:** https:// only, SSRF guard (reject RFC1918/loopback/link-local) — unchanged
+- **Internal webhooks:** http:// allowed **if** hostname resolves to RFC1918/loopback — for squad coordination on LAN without TLS overhead
+
+**Security rationale:** Only authenticated tenants (with OPM_TENANT_KEYS) can register webhooks; if an attacker holds a valid key, they already have full task CRUD. Re-validate IP at delivery time to mitigate DNS rebinding.
+
+**Decision:** Deferred to Elliot. Conservative alternative: keep HTTPS-only; use SSE for internal coordination.
+
+### 5. Endpoint Summary
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | /api/v1/events | SSE stream of real-time server state updates |
+| POST | /api/v1/notifications | Teams push status updates to OPM |
+| GET | /api/v1/notifications | Retrieve recent notifications (stub in v0.2.0) |
+| GET | /api/v1/stats?detailed=true | Comprehensive server state snapshot |
+
+### 6. Implementation Phases
+
+- **Phase 1:** SSE Event Stream — asyncio.Queue bus, task write ops publish events, SSE endpoint with fanout
+- **Phase 2:** Team Notifications Inbox — POST endpoint, broadcast to SSE, GET stub
+- **Phase 3:** State Snapshot Extension — extend /stats with ?detailed=true
+- **Phase 4:** Internal Webhooks — optional; defer if controversial
+
+### 7. Open Questions for Elliot
+
+1. SSE event payload shape vs webhook payload shape (exact match or more granular?)
+2. Metrics to include in server.health
+3. Trigger threshold for queue.stats events
+4. Notification persistence: v0.2.0 or defer to v0.3.0?
+5. Internal webhook split: approve or reject?
+
+### 8. Risks & Mitigations
+
+| Risk | Mitigation |
+|------|-----------|
+| SSE connection saturation | ConnectionTimeoutMiddleware + uvicorn limits; max_sse_clients in v0.3.0 |
+| Event fanout scalability | Per-client queue copy in v0.2.0; pub/sub in v0.3.0 |
+| Notification spam | Trust authenticated tenants in v0.2.0; rate limits in v0.3.0 |
+| Internal webhook DNS rebinding | Re-validate IP at delivery time; or reject internal webhooks entirely |
+
+### 9. Recommendation
+
+**Implement in v0.2.0:**
+1. ✅ GET /api/v1/events — SSE stream
+2. ✅ POST /api/v1/notifications — Ephemeral, broadcast to SSE clients
+3. ✅ Extend GET /api/v1/stats with ?detailed=true
+4. ⚠️ Internal webhook split — defer decision to Elliot
+
+**Defer to v0.3.0:** SQLite notifications, rate limiting, advanced SSE optimizations.
+
+**Status:** Ready for Elliot's review.
+
+---
+
+## 2026-04-02: Mobley — Squad Knowledge Server OPM Connection Support
+
+**Author:** Mobley (Samar Asif), Integration & External Systems Specialist  
+**Date:** 2026-04-02  
+**Context:** Squad Knowledge Server support request from Andrew
+
+### Summary
+
+Provided OPM connection support to Squad Knowledge Server team (westworld squad) and coordinator via SKS open questions system. Answered 2 OPM-related questions and posted comprehensive connection guide.
+
+### Questions Answered
+
+#### 1. Maeve (westworld) - OPM Tools Not Available
+
+**Issue:** mcp-config.json configured correctly with OPM server details (`http://192.168.1.178:8765/mcp`, bearer token present), but MCP tools (`create_task`, `list_tasks`, etc.) not appearing in session.
+
+**Root Causes Identified:**
+1. MCP config cache not reloaded after adding/modifying server entry
+2. Wrong transport type in config (common error: using "sse" instead of "http")
+3. Port 8765 blocked by firewall
+4. OPM server not running or hung
+
+**Solution Provided:**
+- **Immediate fix**: Call `/mcp reload` slash command in CLI (NOT `mcp_reload` tool)
+- **Config verification**: Ensure `"type": "http"` (critical - must NOT be "sse")
+- **Auth check**: Verify `OPM_BEARER_TOKEN` environment variable set
+- **Connectivity test**: `curl http://192.168.1.178:8765/mcp` should respond
+- **Firewall**: Verify port 8765 open: `sudo ufw allow 8765/tcp && sudo ufw reload`
+
+#### 2. Coordinator - Port 8765 Firewall Access
+
+**Issue:** Attempted `sudo ufw allow 8765/tcp && sudo ufw reload` but port still timing out from LAN. Cannot run sudo interactively but can run via non-interactive commands.
+
+**Solution Provided:**
+- UFW rule verification: `sudo ufw status numbered`
+- Verify OPM server binding: `netstat -tulpn | grep 8765` (must bind to 0.0.0.0, not 127.0.0.1)
+- Verify OPM process: `ps aux | grep open-project-manager`
+- Restart if needed: `/home/skitterphuger/mcp/open-project-manager/start.sh`
+- Additional check: UFW must be enabled (`sudo ufw status` should show "active")
+
+### Connection Guide Posted
+
+Posted comprehensive "OPM Connection Guide" to Squad Knowledge Server covering:
+
+#### Server Details
+- **URL**: `http://192.168.1.178:8765/mcp`
+- **Transport**: streamable-HTTP (MCP spec 2025-03-26)
+- **Port**: 8765
+- **Auth**: Bearer token via `Authorization` header
+
+#### mcp-config.json Template
+```json
+{
+  "mcpServers": {
+    "open-project-manager": {
+      "type": "http",
+      "url": "http://192.168.1.178:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:OPM_BEARER_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+#### Registered Squads
+mrrobot, westworld, fsociety, coordinator, ralph
+
+#### Troubleshooting Sections
+- 401 Unauthorized / OAuth errors
+- Tools not appearing
+- Timeout on LAN
+- Transport mode differences (HTTP vs SSE)
+
+#### REST API Access
+- Base URL: `http://192.168.1.178:8765/api/v1`
+- Requires `--rest-api` flag on server startup
+- Same bearer token auth as MCP tools
+
+### Key Technical Findings
+
+#### 1. MCP Config Reload Mechanism
+**Finding:** MCP server registry requires explicit CLI slash command to reload configuration.
+
+**Implication:** Users adding OPM to mcp-config.json must run `/mcp reload` CLI command (not `mcp_reload` tool) to make tools available in current session. This is not documented prominently, leading to "config looks correct but tools missing" support requests.
+
+**Recommendation:** Document this in OPM README and any onboarding materials.
+
+#### 2. Transport Type Confusion
+**Finding:** "sse" vs "http" in mcp-config.json is a common misconfiguration.
+
+**Context:**
+- OPM uses streamable-HTTP (`/mcp` endpoint) when run with `--http` flag
+- Squad Knowledge Server uses SSE (`/sse` endpoint) when run with `--sse` flag
+- Config type must match server's transport mode
+
+**Failure Mode:** Using `"type": "sse"` for OPM causes silent failure - no errors, tools just don't load.
+
+**Recommendation:** OPM documentation should prominently state "use type: http" and warn against type: sse.
+
+#### 3. Firewall vs Config Validity
+**Finding:** Firewall blocking port 8765 and invalid mcp-config.json produce similar symptoms (tools not available).
+
+**Diagnostic Sequence:**
+1. Verify config syntax and type field
+2. Verify `/mcp reload` run
+3. Test server connectivity: `curl http://192.168.1.178:8765/mcp`
+4. If curl times out → firewall issue
+5. If curl returns 401 → auth issue (token mismatch)
+6. If curl returns 405 Method Not Allowed → server reachable, check config reload
+
+#### 4. Squad Knowledge Server Integration Pattern
+**Implementation:** Used MCP Python SDK (`mcp.client.sse.sse_client`) to interact with SKS.
+
+**SSE Message Flow:**
+1. GET `/sse` → receive `endpoint` event with session_id
+2. POST `/messages/?session_id=X` with JSON-RPC request
+3. Listen on same SSE stream for JSON-RPC response matching request ID
+
+**Tools Used:**
+- `list_open_questions` → returns JSON array of question posts
+- `answer_question` → posts answer to specific question by post_id
+- `post_group_knowledge` → creates new knowledge post (topic: opm-connection-guide)
+
+**Learnings:**
+- SSE transport is async - POST returns 202 Accepted, response comes via stream
+- Session lifecycle: connection → endpoint extraction → tool calls → close
+- SDK handles JSON-RPC framing and response matching automatically
+
+### Deliverables
+
+1. **Answers Posted:** 2 specific answers to Maeve and coordinator's questions
+2. **Connection Guide:** Comprehensive OPM connection guide posted to SKS (topic: opm-connection-guide)
+3. **Scripts:** Working Python scripts for SKS interaction (kept for reference)
+4. **History Entry:** Updated `.squad/agents/mobley/history.md` with session details
+
+### Recommendations
+
+#### For OPM Documentation
+1. Add prominent "Connection Guide" section to README
+2. Emphasize `"type": "http"` requirement in mcp-config.json examples
+3. Document `/mcp reload` requirement after config changes
+4. Include firewall/port troubleshooting section
+
+#### For Squad Knowledge Server
+No changes needed - tool interface worked well. Answered questions successfully.
+
+#### For Future Cross-Squad Support
+Pattern established:
+1. Check SKS open questions regularly (can automate)
+2. Answer OPM-specific questions with technical details
+3. Post general guides for reusable knowledge
+4. Document integration patterns for other teams
+
+---
+
+**Status:** Complete  
+**Follow-up:** None required
