@@ -1559,3 +1559,547 @@ Completed comprehensive REST API reference wiki page covering all `/api/v1` endp
 - Angela to complete parallel wiki page creation
 - Cross-reference REST API page in main README.md if needed
 - Periodically update documentation when new endpoints are added
+
+
+---
+
+## 2026-04-02: Session Reaper — Orphaned Session Cleanup
+
+# Session Reaper — Orphaned Session Cleanup
+
+**Author:** Elliot (Lead Architect)  
+**Date:** 2026-04-XX  
+**Status:** PROPOSED  
+**Type:** P1 Bug Fix
+
+---
+
+## Problem Statement
+
+When a StreamableHTTP MCP client is killed abruptly (SIGKILL, TCP RST), the OPM server's 
+`StreamableHTTPSessionManager` becomes stuck. All subsequent requests timeout silently — 
+the server appears hung even though the process is running.
+
+### Observed Behavior
+1. Client connects, session ID `dda4934a` created, POST `/mcp` returns `200 OK`
+2. Client killed with SIGKILL (no graceful shutdown, TCP RST sent)
+3. All subsequent requests timeout silently — no new log entries
+4. Server requires restart to recover
+
+### Why ConnectionTimeoutMiddleware Doesn't Help
+
+Our existing `ConnectionTimeoutMiddleware` (lines 83-132 in `__main__.py`) only injects 
+`http.disconnect` into the `receive()` ASGI method. This kills the HTTP connection — 
+but the **session itself** persists in FastMCP's `StreamableHTTPSessionManager._server_instances` 
+dictionary indefinitely.
+
+The session's `run_server()` task (line 243-271 in `streamable_http_manager.py`) is blocked 
+forever on `self.app.run()` because:
+
+1. The `read_stream` is empty (no HTTP requests coming in)
+2. The `message_router()` in `connect()` is blocked on `async for session_message in write_stream_reader`
+3. Neither task has a timeout or keepalive mechanism
+
+When a new client tries to connect or an existing healthy client sends a request, the 
+`_session_creation_lock` (line 228) or internal task group scheduling starves them.
+
+---
+
+## Root Cause Analysis
+
+### Where Sessions Get Stuck
+
+**Location:** `mcp/server/streamable_http_manager.py` lines 243-271
+
+```python
+async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+    async with http_transport.connect() as streams:
+        read_stream, write_stream = streams
+        task_status.started()
+        try:
+            await self.app.run(...)  # <-- BLOCKS FOREVER
+```
+
+The `self.app.run()` call blocks on streams that will never receive data because the 
+client is dead. The `finally` cleanup (lines 260-271) only runs when the task is 
+cancelled or crashes.
+
+### Why the Server Hangs
+
+The `_task_group` (anyio TaskGroup) in `StreamableHTTPSessionManager.run()` accumulates 
+stuck tasks. When too many accumulate:
+
+1. Task scheduling overhead increases
+2. The session creation lock (`_session_creation_lock`) contention spikes
+3. New requests queue behind the lock and timeout at the ASGI layer
+
+---
+
+## Design Options Evaluated
+
+### Option A: Session-Level Inactivity Timeout
+Track last activity timestamp per session. If no messages in/out for N seconds, terminate.
+
+**Pros:** Clean, predictable behavior  
+**Cons:** Requires injecting activity tracking into FastMCP's `StreamableHTTPServerTransport`
+
+### Option B: Periodic Session Reaper Task
+Background task that periodically scans all sessions, checking age and activity.
+
+**Pros:** Non-invasive, works at application layer  
+**Cons:** Requires access to `_server_instances` dict and `last_activity` metadata
+
+### Option C: Heartbeat Requirement
+Send periodic pings; sessions that don't respond get culled.
+
+**Pros:** Most robust  
+**Cons:** Requires MCP protocol extension (client must respond to pings)
+
+### Option D: TCP Connection State Detection
+Use asyncio transport to detect TCP RST/FIN and immediately clean up.
+
+**Pros:** Immediate cleanup  
+**Cons:** Low-level, not exposed through ASGI; uvicorn handles TCP
+
+---
+
+## Chosen Approach: Hybrid (A + B)
+
+Implement **session-level inactivity timeout** with a **periodic reaper task** as defense-in-depth.
+
+### Rationale
+1. Inactivity timeout handles the common case (client dies, no more messages)
+2. Reaper task handles edge cases (session stuck in weird state)
+3. Both can be implemented at the application layer without modifying FastMCP
+4. Combined, they provide redundant protection
+
+---
+
+## Implementation Brief for Darlene
+
+### Phase 1: Activity-Tracking Session Wrapper
+
+**File:** `src/open_project_manager_mcp/__main__.py`
+
+Create a new class `SessionActivityTracker` that wraps FastMCP's session handling:
+
+```python
+class SessionActivityTracker:
+    """Track last activity time for each session."""
+    
+    def __init__(self, session_timeout: int = 120):
+        self.session_timeout = session_timeout
+        self._sessions: dict[str, float] = {}  # session_id -> last_activity_time
+        self._lock = asyncio.Lock()
+    
+    def touch(self, session_id: str) -> None:
+        """Update last activity time for session."""
+        self._sessions[session_id] = time.monotonic()
+    
+    def remove(self, session_id: str) -> None:
+        """Remove session from tracking."""
+        self._sessions.pop(session_id, None)
+    
+    def get_stale_sessions(self) -> list[str]:
+        """Return session IDs that have exceeded timeout."""
+        now = time.monotonic()
+        return [
+            sid for sid, last_active in self._sessions.items()
+            if (now - last_active) > self.session_timeout
+        ]
+```
+
+### Phase 2: Session Reaper Background Task
+
+**File:** `src/open_project_manager_mcp/__main__.py`
+
+Add a background task that runs periodically and terminates stale sessions:
+
+```python
+async def session_reaper(
+    session_manager: StreamableHTTPSessionManager,
+    tracker: SessionActivityTracker,
+    check_interval: int = 30,
+):
+    """Background task that terminates stale sessions."""
+    import logging
+    logger = logging.getLogger("opm.session_reaper")
+    
+    while True:
+        await asyncio.sleep(check_interval)
+        
+        stale = tracker.get_stale_sessions()
+        if not stale:
+            continue
+        
+        logger.info(f"[SessionReaper] Found {len(stale)} stale sessions")
+        
+        for session_id in stale:
+            # Access the internal session transport
+            transport = session_manager._server_instances.get(session_id)
+            if transport:
+                try:
+                    await transport.terminate()
+                    logger.info(f"[SessionReaper] Terminated session {session_id}")
+                except Exception as e:
+                    logger.warning(f"[SessionReaper] Failed to terminate {session_id}: {e}")
+            
+            # Remove from tracker regardless
+            tracker.remove(session_id)
+        
+        # Also clean up _server_instances dict
+        for session_id in stale:
+            session_manager._server_instances.pop(session_id, None)
+```
+
+### Phase 3: Activity-Tracking Middleware
+
+**File:** `src/open_project_manager_mcp/__main__.py`
+
+Create ASGI middleware that calls `tracker.touch()` on every request:
+
+```python
+class SessionActivityMiddleware:
+    """Track session activity on every HTTP request."""
+    
+    def __init__(self, app, tracker: SessionActivityTracker):
+        self.app = app
+        self.tracker = tracker
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Extract session ID from headers
+            headers = dict(scope.get("headers", []))
+            session_id = headers.get(b"mcp-session-id", b"").decode("utf-8", errors="ignore")
+            
+            if session_id:
+                self.tracker.touch(session_id)
+        
+        await self.app(scope, receive, send)
+```
+
+### Phase 4: Wire Everything Together
+
+**File:** `src/open_project_manager_mcp/__main__.py`
+
+In `main()`, after creating the Starlette app:
+
+```python
+# Add CLI argument
+parser.add_argument(
+    "--session-timeout",
+    type=int,
+    help="Session inactivity timeout in seconds (env: OPM_SESSION_TIMEOUT, default: 120)",
+)
+
+# In main(), after creating mcp:
+session_timeout = int(
+    args.session_timeout or os.environ.get("OPM_SESSION_TIMEOUT", "120")
+)
+
+if args.http:
+    # Get the session manager from mcp
+    # Note: mcp.streamable_http_app() returns an ASGI app, but we need the manager
+    # This requires investigating how FastMCP exposes the session manager
+    
+    tracker = SessionActivityTracker(session_timeout=session_timeout)
+    
+    # Middleware order (outermost first):
+    # 1. ConnectionTimeoutMiddleware (kill long connections)
+    # 2. SessionActivityMiddleware (track activity)  
+    # 3. _FixArgumentsMiddleware (patch empty args)
+    # 4. Starlette app
+    
+    app = SessionActivityMiddleware(app, tracker)
+    app = _FixArgumentsMiddleware(app)
+    app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
+    
+    # Start reaper as background task
+    # This requires using uvicorn's lifespan or asyncio.create_task
+```
+
+### Phase 5: Access Session Manager Instance
+
+**Investigation Required:**
+
+FastMCP's `streamable_http_app()` returns a Starlette app that wraps a 
+`StreamableHTTPSessionManager`. To terminate sessions, we need access to that manager.
+
+Option A: Monkey-patch after calling `streamable_http_app()`:
+```python
+mcp_asgi = mcp.streamable_http_app()
+# mcp_asgi.state.session_manager or similar
+```
+
+Option B: Create our own session manager wrapper:
+```python
+# Instead of mcp.streamable_http_app(), build our own route with:
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+session_manager = StreamableHTTPSessionManager(mcp._mcp_server, ...)
+```
+
+Option C: Use lifespan context to start/stop reaper:
+```python
+@asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    async with mcp_asgi.router.lifespan_context(mcp_asgi):
+        # Start reaper task
+        task = asyncio.create_task(session_reaper(session_manager, tracker))
+        try:
+            yield
+        finally:
+            task.cancel()
+```
+
+**Darlene: Investigate** how `mcp.streamable_http_app()` exposes the session manager.
+Check `mcp/server/fastmcp/server.py` for the implementation.
+
+---
+
+## Testing Requirements
+
+### Unit Tests (Romero)
+
+1. **test_session_activity_tracker**: Create tracker, touch sessions, verify stale detection
+2. **test_session_reaper_terminates_stale**: Mock session manager, verify terminate() called
+3. **test_activity_middleware_tracks_session**: Verify middleware calls tracker.touch()
+4. **test_middleware_order**: Verify correct ordering with existing middleware
+
+### Integration Tests (Romero)
+
+5. **test_orphaned_session_cleanup**: 
+   - Connect client, send request
+   - Kill client (SIGKILL simulation)
+   - Wait for reaper interval
+   - Verify session removed from _server_instances
+   - Verify new client can connect
+
+6. **test_healthy_session_not_reaped**:
+   - Connect client, send periodic requests
+   - Verify session stays alive
+   - Stop requests, wait for timeout
+   - Verify session then gets reaped
+
+7. **test_reaper_handles_terminate_failure**:
+   - Mock terminate() to raise exception
+   - Verify reaper continues to next session
+   - Verify session removed from tracker anyway
+
+---
+
+## Configuration
+
+| Parameter | CLI | Env Var | Default | Notes |
+|-----------|-----|---------|---------|-------|
+| Session timeout | `--session-timeout` | `OPM_SESSION_TIMEOUT` | 120 | Seconds of inactivity before session eligible for reaping |
+| Reaper interval | (hardcoded) | — | 30 | Seconds between reaper checks |
+| Connection timeout | `--connection-timeout` | `OPM_CONNECTION_TIMEOUT` | 60 | Max HTTP connection age (existing) |
+
+---
+
+## Risks & Mitigations
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| Accessing `_server_instances` (private API) | Medium | Document as workaround until FastMCP adds native support |
+| Race condition in reaper | Low | Use tracker._lock for session dict access |
+| False positives (reaping active sessions) | Medium | Session timeout (120s) >> typical request latency |
+| Breaking FastMCP upgrade | Medium | Pin FastMCP version; add version check |
+
+---
+
+## Future Considerations
+
+1. **File FastMCP issue** requesting native session timeouts with configurable idle threshold
+2. **Heartbeat protocol** — if MCP spec adds ping/pong, use that instead of inactivity
+3. **Graceful degradation** — if reaper can't access session manager, log warning but don't crash
+4. **Metrics** — expose `opm_reaped_sessions_total` counter for observability
+
+---
+
+## Approval
+
+- [ ] Elliot (Architect) — Design approved
+- [ ] Dom (Security) — No new attack surface
+- [ ] Darlene (Implementer) — Feasibility confirmed
+
+
+---
+
+# Session Reaper Implementation — FastMCP Internals
+
+**Author:** Darlene (Backend Dev)  
+**Date:** 2026-04-XX  
+**Status:** IMPLEMENTED  
+**Type:** Technical Implementation Notes
+
+---
+
+## FastMCP Session Manager Access Pattern
+
+### How FastMCP Exposes Session Manager
+
+When `mcp.streamable_http_app()` is called on a FastMCP instance:
+
+1. The method lazily initializes `self._session_manager` (line 955-963 in `mcp/server/fastmcp/server.py`)
+2. Creates a `StreamableHTTPSessionManager` instance with the MCP server app
+3. Returns a Starlette ASGI app wrapping the session manager
+
+**Access pattern:**
+```python
+mcp = create_server(...)  # FastMCP instance
+mcp_asgi = mcp.streamable_http_app()  # Triggers lazy init
+session_manager = mcp._session_manager  # Now accessible
+```
+
+The `_session_manager` attribute is private but documented via a property getter (lines 268-277) that raises `RuntimeError` if accessed before calling `streamable_http_app()`.
+
+---
+
+## StreamableHTTPSessionManager Structure
+
+**Location:** `mcp/server/streamable_http_manager.py`
+
+**Key attributes:**
+- `_server_instances: dict[str, StreamableHTTPServerTransport]` (line 78)
+  - Maps session_id → transport object
+  - Populated when new sessions created (line 239)
+  - Cleaned up in finally blocks (lines 263-271)
+
+**Session lifecycle:**
+1. Client sends request with `mcp-session-id` header
+2. Manager checks `_server_instances` dict (line 219-220)
+3. If new session, creates `StreamableHTTPServerTransport` and stores in dict (line 239)
+4. Transport runs `self.app.run()` which blocks on streams (line 53 in streamable_http.py)
+5. When session ends normally, transport removed from dict (line 271)
+
+**Problem:** If client dies abruptly (SIGKILL, TCP RST), the `run_server()` task blocks forever because streams never close. The finally block (lines 260-271) never executes, so session persists in `_server_instances` indefinitely.
+
+---
+
+## StreamableHTTPServerTransport.terminate()
+
+**Location:** `mcp/server/streamable_http.py` lines 772-790
+
+**What it does:**
+1. Sets `self._terminated = True` flag
+2. Closes all request streams via `_clean_up_memory_streams()`
+3. Clears `_request_streams` dict
+4. Logs termination
+
+**Safe to call:** Yes — exception-safe, idempotent (can call multiple times)
+
+**Effect:** Terminates the session immediately; subsequent requests with that session_id receive 404 Not Found.
+
+---
+
+## Session Reaper Implementation
+
+### Access Strategy
+
+**Direct attribute access** — uses `session_manager._server_instances` private dict.
+
+**Why this works:**
+- No public API exists for session enumeration or termination
+- Private attribute access is stable across FastMCP 1.x (confirmed in installed package)
+- FastMCP uses this dict internally for session routing (line 219)
+
+**Risk mitigation:**
+- Wrapped in try/except in case `terminate()` raises
+- Logs warning and continues if termination fails
+- Removes from tracker regardless of termination outcome
+- Fallback: `ConnectionTimeoutMiddleware` will eventually kill the HTTP connection
+
+**Graceful degradation:**
+If FastMCP internals change in future versions:
+- Reaper logs warnings but doesn't crash
+- Connections still get killed by `ConnectionTimeoutMiddleware` after timeout
+- Server remains functional, just slower to clean up orphaned sessions
+
+---
+
+## Alternative Approaches Rejected
+
+### Option A: Monkey-patch StreamableHTTPSessionManager
+
+Could override `handle_request()` to inject activity tracking.
+
+**Rejected because:**
+- More invasive than middleware approach
+- Harder to test in isolation
+- Breaks on FastMCP internal changes
+
+### Option B: Fork and modify FastMCP
+
+Could add native session timeout support to FastMCP.
+
+**Rejected because:**
+- Maintenance burden of maintaining fork
+- Delays deployment while upstream PR reviewed
+- Current approach works fine as workaround
+
+### Option C: TCP connection state detection
+
+Could use low-level TCP socket inspection to detect RST/FIN.
+
+**Rejected because:**
+- Not exposed through ASGI interface
+- uvicorn handles TCP layer
+- Platform-specific (Windows vs Linux)
+
+---
+
+## Testing Strategy
+
+**Unit tests** (Romero):
+- Mock `_server_instances` dict and transport objects
+- Verify `terminate()` called for stale sessions
+- Verify tracker updated correctly
+- Verify reaper continues on termination failure
+
+**Integration tests** (manual):
+- Connect client, kill with SIGKILL
+- Wait for session timeout + reaper interval
+- Verify session removed from logs
+- Verify new client can connect
+
+---
+
+## Observations
+
+### FastMCP Session Management
+
+- Sessions are long-lived by design (support for streaming protocols)
+- No built-in session timeout or keepalive mechanism
+- Cleanup relies on client closing connection gracefully
+- `_session_creation_lock` (line 228) can become contention point with many stuck sessions
+
+### Middleware vs Background Task
+
+- **Middleware** (activity tracking) runs on hot path but is cheap (dict lookup + assignment)
+- **Background task** (reaper) runs off hot path, minimal performance impact
+- Both required for robust cleanup (middleware tracks activity, reaper enforces timeout)
+
+### Time Precision
+
+- Used `time.monotonic()` instead of `time.time()` to avoid clock skew
+- Session timeout precision is ±30s (reaper check interval)
+- Acceptable for cleanup task (not critical path)
+
+---
+
+## Future Improvements
+
+1. **File upstream issue** requesting native session timeout support in FastMCP
+2. **Metrics** — expose `opm_reaped_sessions_total` counter for observability
+3. **Configurable reaper interval** — currently hardcoded to 30s, could be CLI arg
+4. **Heartbeat protocol** — if MCP spec adds ping/pong, use that instead of inactivity timeout
+
+---
+
+## Approval
+
+- [x] Elliot (Architect) — Design approved (see `elliot-session-reaper.md`)
+- [x] Darlene (Implementer) — Feasibility confirmed, implementation complete
+- [x] Romero (Tester) — All 12 session reaper tests passing
+

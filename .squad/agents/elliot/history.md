@@ -195,3 +195,53 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 **Test coverage:** 54 new tests (318 total)
 
 **Messaging architecture decision merged to decisions.md** — includes Elliot's full Phase 1-3 architecture, reconciliation with Mobley's protocol design, Andrew's 7 final decisions, and Build Order 8-10 scope.
+
+### 2026-04-02 — Session Reaper Design & Implementation (Orphaned Session Bug)
+
+**Task:** Diagnose and design fix for P1 bug where abruptly killed MCP clients leave orphaned sessions that block all subsequent requests. Delivered complete implementation with testing.
+
+**Root Cause Analysis:**
+- SKS coordinator reported: client killed with SIGKILL, server hung, required restart
+- `ConnectionTimeoutMiddleware` kills HTTP connections but NOT the underlying FastMCP session
+- Sessions persist in `StreamableHTTPSessionManager._server_instances` indefinitely
+- `run_server()` task blocks forever on `self.app.run()` waiting on dead streams
+- Task accumulation + `_session_creation_lock` contention starves new requests
+
+**Key Finding:** The bug is in FastMCP's session manager design, NOT our middleware:
+- `mcp/server/streamable_http_manager.py` lines 243-271: `run_server()` has no timeout
+- `mcp/server/streamable_http.py` lines 989-1047: `message_router()` blocks indefinitely
+- Neither has keepalive or inactivity detection
+
+**Design Decision:** Hybrid approach (session-level inactivity timeout + periodic reaper task)
+- `SessionActivityTracker` class tracks last-activity timestamp per session
+- `SessionActivityMiddleware` updates tracker on every HTTP request with session ID
+- `session_reaper()` background task terminates stale sessions every 30s
+- Default session timeout: 120 seconds of inactivity
+
+**Deliverables:** 
+- `.squad/decisions.md` merged entry — full design, root cause, 5-phase implementation plan, testing requirements
+- Orchestration log: `.squad/orchestration-log/20260402T205710Z-session-reaper.md`
+- Session log: `.squad/log/20260402T205710Z-session-reaper-fix.md`
+
+**Status:** COMPLETE — Implementation delivered by Darlene, 12 tests passing (330 total)
+
+## Learnings
+
+### FastMCP StreamableHTTP session lifecycle
+- `StreamableHTTPSessionManager.run()` creates a task group that spawns per-session tasks
+- Each session's `run_server()` task blocks on `self.app.run()` until cancelled
+- Sessions stored in `_server_instances` dict, keyed by session ID
+- No built-in inactivity timeout or keepalive mechanism
+- `terminate()` method exists but must be called explicitly
+
+### ASGI middleware layering for session management
+- HTTP connection timeout (ConnectionTimeoutMiddleware) ≠ session timeout
+- Session activity must be tracked separately at the application layer
+- MCP session ID in `mcp-session-id` header, accessible in ASGI scope
+- Middleware order matters: outer middleware sees requests first
+
+### Diagnosing event loop saturation
+- Stuck tasks accumulate in anyio TaskGroup, increasing scheduling overhead
+- Lock contention (`_session_creation_lock`) creates cascading timeouts
+- Server process appears healthy (running, logging stopped) but unresponsive
+- Symptom: new requests timeout with no log entries = task starvation

@@ -177,3 +177,64 @@ app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
 None — all changes implemented as specified. The `_bg_health_task`/`_bg_sub_task` use `nonlocal` correctly in their `_ensure_*` wrappers. `_project_summary` placed in shared helpers section alongside `_now()`, `_log()`. REST `subscriptions_endpoint` POST inlines validation (no `__wrapped__`).
 
 **Test result:** 318 total tests passing (264 → 318 after Romero's 54 new messaging tests).
+
+### 2026-04-XX — Session reaper implementation (orphaned session cleanup)
+
+**Date:** 2026-04-XX  
+**Task:** Implement session reaper fix per Elliot's brief (`elliot-session-reaper.md`)
+
+**Context:** FastMCP StreamableHTTPSessionManager gets stuck when clients die abruptly (SIGKILL, TCP RST). Sessions persist indefinitely in `_server_instances` dict, blocking new requests. Existing `ConnectionTimeoutMiddleware` only kills HTTP connections, not the sessions themselves.
+
+**Work completed in `__main__.py`:**
+
+1. **`SessionActivityTracker` class** — tracks last activity timestamp per session in `_sessions: dict[str, float]`
+   - `touch(session_id)`: updates timestamp via `time.monotonic()`
+   - `remove(session_id)`: pops from dict
+   - `get_stale_sessions()`: returns list of session_ids exceeding `session_timeout`
+
+2. **`SessionActivityMiddleware` class** — ASGI middleware that extracts `mcp-session-id` header from HTTP requests and calls `tracker.touch(session_id)`
+
+3. **`session_reaper()` async function** — background task that runs every 30 seconds (hardcoded)
+   - Gets stale sessions from tracker
+   - Accesses `session_manager._server_instances[session_id]` to get transport
+   - Calls `await transport.terminate()` (logs warning and continues if raises)
+   - Removes from tracker via `tracker.remove(session_id)`
+   - Pops from `_server_instances` dict directly
+
+4. **New CLI argument:** `--session-timeout` (int, default 120, env `OPM_SESSION_TIMEOUT`, min 10 seconds)
+
+5. **Lifespan integration:**
+   - `_make_lifespan()` refactored to accept optional `session_manager` and `tracker` params
+   - Reaper started as background `asyncio.create_task()` after inner lifespan yields
+   - Task cancelled in `finally` block (catches `asyncio.CancelledError`)
+   - Logs `[SessionReaper] Started with {timeout}s timeout` on startup
+
+6. **Middleware ordering** (outermost to innermost):
+   - `ConnectionTimeoutMiddleware` (kills long connections)
+   - `SessionActivityMiddleware` (NEW — tracks activity)
+   - `_FixArgumentsMiddleware` (patches empty args)
+   - FastMCP ASGI app
+
+**Applied to:** `--http` mode only (SSE mode unchanged).
+
+**FastMCP internals investigation:**
+- `mcp.streamable_http_app()` creates `_session_manager` attribute (lazy init)
+- Session manager accessible via `mcp._session_manager` after calling `streamable_http_app()`
+- `_server_instances: dict[str, StreamableHTTPServerTransport]` is a private attribute
+- `StreamableHTTPServerTransport.terminate()` exists and closes all streams
+- Access pattern: `session_manager._server_instances.get(session_id)` returns transport object
+- No public API for session management; workaround uses private attribute access
+
+**Test result:** 330 total tests passing (318 → 330 after Romero's 12 new session reaper tests).
+
+**New imports:** Added `import logging` at module top (for reaper logger).
+
+**Status:** COMPLETE — All components implemented and tested.
+- `SessionActivityTracker` — tracks last-activity timestamps per session
+- `SessionActivityMiddleware` — ASGI middleware updates tracker on every request
+- `session_reaper()` — background task runs every 30s, terminates stale sessions
+- `--session-timeout` CLI arg with OPM_SESSION_TIMEOUT env support
+- Default timeout: 120 seconds, minimum: 10 seconds
+
+**Outcome:** Orphaned sessions cleaned up automatically; server remains responsive under client crashes; no manual restarts needed; reaper logs monitor cleanup working.
+

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import secrets
 import sys
@@ -78,6 +79,49 @@ class _FixArgumentsMiddleware:
                 return {"type": "http.request", "body": b"", "more_body": False}
 
         await self.app(scope, patched_receive, original_send)
+
+
+class SessionActivityTracker:
+    """Track last activity time for each session."""
+    
+    def __init__(self, session_timeout: int = 120):
+        self.session_timeout = session_timeout
+        self._sessions: dict[str, float] = {}  # session_id -> last_activity_time
+    
+    def touch(self, session_id: str) -> None:
+        """Update last activity time for session."""
+        self._sessions[session_id] = time.monotonic()
+    
+    def remove(self, session_id: str) -> None:
+        """Remove session from tracking."""
+        self._sessions.pop(session_id, None)
+    
+    def get_stale_sessions(self) -> list[str]:
+        """Return session IDs that have exceeded timeout."""
+        now = time.monotonic()
+        return [
+            sid for sid, last_active in self._sessions.items()
+            if (now - last_active) > self.session_timeout
+        ]
+
+
+class SessionActivityMiddleware:
+    """Track session activity on every HTTP request."""
+    
+    def __init__(self, app, tracker: SessionActivityTracker):
+        self.app = app
+        self.tracker = tracker
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Extract session ID from headers
+            headers = dict(scope.get("headers", []))
+            session_id = headers.get(b"mcp-session-id", b"").decode("utf-8", errors="ignore")
+            
+            if session_id:
+                self.tracker.touch(session_id)
+        
+        await self.app(scope, receive, send)
 
 
 class ConnectionTimeoutMiddleware:
@@ -198,6 +242,40 @@ def _check_network_auth(
         )
 
 
+async def session_reaper(
+    session_manager,
+    tracker: SessionActivityTracker,
+    check_interval: int = 30,
+):
+    """Background task that terminates stale sessions."""
+    logger = logging.getLogger("opm.session_reaper")
+    
+    while True:
+        await asyncio.sleep(check_interval)
+        
+        stale = tracker.get_stale_sessions()
+        if not stale:
+            continue
+        
+        logger.info(f"[SessionReaper] Found {len(stale)} stale sessions")
+        
+        for session_id in stale:
+            # Access the internal session transport
+            transport = session_manager._server_instances.get(session_id)
+            if transport:
+                try:
+                    await transport.terminate()
+                    logger.info(f"[SessionReaper] Terminated session {session_id}")
+                except Exception as e:
+                    logger.warning(f"[SessionReaper] Failed to terminate {session_id}: {e}")
+            
+            # Remove from tracker regardless
+            tracker.remove(session_id)
+            
+            # Also clean up _server_instances dict
+            session_manager._server_instances.pop(session_id, None)
+
+
 def main():
     if sys.platform == "win32":
         default_db_dir = platformdirs.user_data_dir("open-project-manager-mcp", appauthor=False)
@@ -264,6 +342,11 @@ def main():
         metavar="SQUAD_NAME",
         help="Generate a bearer token for the named squad and print OPM_TENANT_KEYS instructions, then exit",
     )
+    parser.add_argument(
+        "--session-timeout",
+        type=int,
+        help="Session inactivity timeout in seconds (env: OPM_SESSION_TIMEOUT, default: 120)",
+    )
 
     args = parser.parse_args()
 
@@ -306,6 +389,16 @@ def main():
     if connection_timeout < 5:
         print(
             f"FATAL: --connection-timeout must be at least 5 seconds (got {connection_timeout})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    
+    session_timeout = int(
+        args.session_timeout or os.environ.get("OPM_SESSION_TIMEOUT", "120")
+    )
+    if session_timeout < 10:
+        print(
+            f"FATAL: --session-timeout must be at least 10 seconds (got {session_timeout})",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -353,31 +446,60 @@ def main():
             )
             sys.exit(1)
 
-        def _make_lifespan(inner_app):
+        def _make_lifespan(inner_app, session_manager=None, tracker=None):
             from contextlib import asynccontextmanager
 
             @asynccontextmanager
             async def _lifespan(app):
                 async with inner_app.router.lifespan_context(inner_app):
-                    yield
+                    # Start session reaper task if in HTTP mode with session tracking
+                    reaper_task = None
+                    if session_manager is not None and tracker is not None:
+                        reaper_task = asyncio.create_task(
+                            session_reaper(session_manager, tracker, check_interval=30)
+                        )
+                        logging.getLogger("opm.session_reaper").info(
+                            f"[SessionReaper] Started with {tracker.session_timeout}s timeout"
+                        )
+                    try:
+                        yield
+                    finally:
+                        if reaper_task is not None:
+                            reaper_task.cancel()
+                            try:
+                                await reaper_task
+                            except asyncio.CancelledError:
+                                pass
 
             return _lifespan
 
         if args.http:
             print(f"Starting open-project-manager-mcp in HTTP mode on {host}:{port}", file=sys.stderr)
             mcp_asgi = mcp.streamable_http_app()
+            
+            # Get session manager from mcp for session reaper
+            session_manager = mcp._session_manager
+            tracker = SessionActivityTracker(session_timeout=session_timeout)
+            
             if args.rest_api and hasattr(mcp, "_rest_router"):
                 print("  REST API mounted at /api/v1", file=sys.stderr)
                 app = Starlette(
                     routes=[Mount("/api/v1", app=mcp._rest_router), Mount("/", mcp_asgi)],
-                    lifespan=_make_lifespan(mcp_asgi),
+                    lifespan=_make_lifespan(mcp_asgi, session_manager, tracker),
                 )
             else:
                 app = Starlette(
                     routes=[Mount("/", mcp_asgi)],
-                    lifespan=_make_lifespan(mcp_asgi),
+                    lifespan=_make_lifespan(mcp_asgi, session_manager, tracker),
                 )
+            
+            # Middleware order (outermost first):
+            # 1. ConnectionTimeoutMiddleware (kill long connections)
+            # 2. SessionActivityMiddleware (track activity)
+            # 3. _FixArgumentsMiddleware (patch empty args)
+            # 4. Starlette app
             app = _FixArgumentsMiddleware(app)
+            app = SessionActivityMiddleware(app, tracker)
             app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
         else:
             print(
