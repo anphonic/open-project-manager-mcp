@@ -94,6 +94,22 @@ Requires `pip install 'open-project-manager-mcp[webhooks]'` (adds `httpx`).
 
 See [Webhooks](#webhooks) for payload shape, events, and signature verification.
 
+### Proactive Messaging (Team Status & Events)
+
+**9 new tools** for real-time squad coordination via team status, event publishing, and SSE subscriptions.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `get_server_stats` | — | Server statistics: task counts, uptime, active SSE connections |
+| `get_project_summary` | `project` | Per-project task summary with overdue count |
+| `set_team_status` | `status`, `message?` | Set your team's status (`online`/`offline`/`busy`/`degraded`) |
+| `get_team_status` | `squad?` | Get all teams' status or specific team |
+| `post_team_event` | `event_type`, `data?` | Push a team event (milestone, error, health report, etc.) |
+| `get_team_events` | `squad?`, `event_type?`, `since?`, `limit?` | Query team events with optional filters |
+| `subscribe_events` | `id`, `subscriber`, `url`, `event_type`, `squad?` | Subscribe to periodic server events (HTTPS URL only) |
+| `list_subscriptions` | `subscriber?` | List event subscriptions |
+| `unsubscribe_events` | `id`, `human_approval` | Remove subscription |
+
 ---
 
 ## Install
@@ -332,6 +348,17 @@ All endpoints are mounted at `/api/v1`. Auth uses the same Bearer token as the M
 | `DELETE` | `/api/v1/tasks/{id}` | Delete (requires `?confirm=true`) |
 | `GET` | `/api/v1/projects` | List projects with open/total counts |
 | `GET` | `/api/v1/stats` | Counts by status/priority + oldest open |
+| `GET` | `/api/v1/events` | Real-time SSE stream (task + server events) |
+| `GET` | `/api/v1/stats?detailed=true` | Extended server state snapshot |
+| `GET` | `/api/v1/projects/{project}/summary` | Project summary with task counts |
+| `PUT` | `/api/v1/status` | Set your team's status (online/offline/busy/degraded) |
+| `GET` | `/api/v1/status` | Get all teams' status |
+| `GET` | `/api/v1/status/{squad}` | Get specific team's status |
+| `POST` | `/api/v1/events` | Push a team event (persisted) |
+| `GET` | `/api/v1/team-events` | Query team events with optional filters |
+| `POST` | `/api/v1/subscriptions` | Create event subscription |
+| `GET` | `/api/v1/subscriptions` | List subscriptions |
+| `DELETE` | `/api/v1/subscriptions/{id}` | Remove subscription |
 
 ### `GET /api/v1/tasks` query params
 
@@ -358,9 +385,136 @@ Any subset of: `title`, `description`, `priority`, `project`, `status`, `assigne
 
 Requires `?confirm=true` query parameter. Returns `{ id, deleted: true }`.
 
+### Server-Sent Events (SSE)
+
+Access real-time task and server events via `GET /api/v1/events`:
+
+```bash
+curl -N -H "Authorization: Bearer <token>" \
+  http://192.168.1.178:8765/api/v1/events
+```
+
+Events are streamed in `text/event-stream` format. Each event has a `data` field (JSON-encoded).
+
+**Task Events:**
+- `task.created` — A task was created. `data` includes full task object.
+- `task.updated` — A task was updated. `data` includes full task object and changed fields.
+- `task.completed` — A task was marked done. `data` includes task `id` and completion time.
+- `task.deleted` — A task was deleted. `data` includes task `id`.
+
+**Server Events:**
+- `server.health` — Server heartbeat (emitted every 30 seconds). `data` includes uptime, active connections, memory.
+- `queue.stats` — Task queue snapshot (emitted after state changes). `data` includes counts by status/priority.
+- `notification.received` — A team posted a notification. `data` includes squad, message, timestamp.
+- `team.status_changed` — A team changed status. `data` includes squad, new status, timestamp.
+- `team.event` — A team published a custom event. `data` includes squad, event type, event data.
+
+**Filtering:**
+
+```bash
+# Only task.created and task.completed
+curl -N "http://192.168.1.178:8765/api/v1/events?event_type=task.created,task.completed" \
+  -H "Authorization: Bearer <token>"
+
+# Only events from a specific squad
+curl -N "http://192.168.1.178:8765/api/v1/events?squad=coordinator" \
+  -H "Authorization: Bearer <token>"
+```
+
 ---
 
-## Webhooks
+## Team Status & Events
+
+Squads can publish status and custom events for cross-team coordination (separate from tasks).
+
+### Team Status
+
+Set your squad's current status (`online`, `offline`, `busy`, `degraded`):
+
+```bash
+curl -X PUT http://192.168.1.178:8765/api/v1/status \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "online", "message": "All systems nominal"}'
+```
+
+View all squads' status:
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  http://192.168.1.178:8765/api/v1/status
+```
+
+Returns: `{ squads: { "mrrobot": { status: "online", message: "...", updated_at: "..." }, ... } }`
+
+### Team Events
+
+Push a custom event from your squad (e.g., "milestone reached", "deployment complete", "degradation"):
+
+```bash
+curl -X POST http://192.168.1.178:8765/api/v1/events \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type": "milestone",
+    "data": { "milestone": "v1.0-release", "completed_at": "2025-01-20T14:30:00Z" }
+  }'
+```
+
+Query all team events (optional filters):
+
+```bash
+# All events from all squads, last 100
+curl -H "Authorization: Bearer <token>" \
+  "http://192.168.1.178:8765/api/v1/team-events?limit=100"
+
+# Only events from 'coordinator' squad
+curl -H "Authorization: Bearer <token>" \
+  "http://192.168.1.178:8765/api/v1/team-events?squad=coordinator"
+
+# Only 'error' events
+curl -H "Authorization: Bearer <token>" \
+  "http://192.168.1.178:8765/api/v1/team-events?event_type=error"
+
+# Events since a specific timestamp
+curl -H "Authorization: Bearer <token>" \
+  "http://192.168.1.178:8765/api/v1/team-events?since=2025-01-20T00:00:00Z"
+```
+
+Returns: `{ events: [ { squad, event_type, data, created_at }, ... ] }`
+
+### Event Subscriptions
+
+Subscribe to periodic event delivery at an HTTPS endpoint (webhooks-style, but for SSE events).
+
+```bash
+curl -X POST http://192.168.1.178:8765/api/v1/subscriptions \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "my-sub-1",
+    "subscriber": "my-service",
+    "url": "https://webhooks.example.com/opm-events",
+    "event_type": "task.completed",
+    "squad": "coordinator"
+  }'
+```
+
+List active subscriptions:
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  http://192.168.1.178:8765/api/v1/subscriptions
+```
+
+Unsubscribe:
+
+```bash
+curl -X DELETE http://192.168.1.178:8765/api/v1/subscriptions/my-sub-1 \
+  -H "Authorization: Bearer <token>"
+```
+
+---
 
 Register a webhook to receive HTTP POST notifications on task events.
 

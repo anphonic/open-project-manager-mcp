@@ -50,4 +50,31 @@ The coordinator (GitHub Copilot CLI) wrote all packaging and documentation direc
 
 **No code changes this session.**
 
+### 2026-04-02 — Deployment & README updates (proactive messaging)
+
+**Task:** Document the proactive messaging system (Build Orders 8-10) with deployment runbook and feature updates to README.
+
+**Actions taken:**
+- **DEPLOY.md (created):** Complete skitterphuger deployment runbook including:
+  - First-time setup (clone, install, token generation, environment)
+  - Environment variables reference
+  - Persistent `start.sh` script template
+  - Upgrading procedure (git pull, reinstall, restart)
+  - Watchdog script for health monitoring + auto-restart
+  - Verification steps (health checks, stats, SSE stream, team status)
+  - Common issues and fixes (401 auth errors, missing tools, port issues, hangs)
+  - mcp-config.json entry for clients
+  - Monitoring, rollback, and backup procedures
+
+- **README.md (updated):** Added comprehensive documentation for new proactive messaging features:
+  - **9 new MCP tools:** `get_server_stats`, `get_project_summary`, `set_team_status`, `get_team_status`, `post_team_event`, `get_team_events`, `subscribe_events`, `list_subscriptions`, `unsubscribe_events`
+  - **14 new REST API endpoints:** SSE stream (`/api/v1/events`), extended stats, project summary, team status endpoints, event posting/querying, subscriptions
+  - **SSE event types:** Task events (`task.*`), server events (`server.health`, `queue.stats`, `notification.received`, `team.status_changed`, `team.event`)
+  - **Team Status & Events section:** Explains how squads set status, push events, and subscribe to periodic delivery
+  - **Event subscription examples:** Full curl commands with optional filters
+
+**No code changes this session. Docs written per existing implementation.**
+
+2026-04-02: Created DEPLOY.md (14KB skitterphuger runbook — start.sh, watchdog, upgrade procedure, troubleshooting, mcp-config.json). Updated README.md with all 9 new MCP tools and 14 new REST endpoints from messaging build orders 8-10. Posted deployment guide to squad knowledge.
+
 ## Learnings
