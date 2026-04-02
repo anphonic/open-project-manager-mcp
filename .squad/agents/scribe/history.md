@@ -4,7 +4,7 @@
 - Project: open-project-manager-mcp
 - Stack: Python, SQLite (stdlib), FastMCP
 - Sibling: squad-knowledge-mcp at J:\Coding\squad-knowledge-mcp
-- Squad Knowledge Server: http://192.168.1.178:8766/mcp
+- Squad Knowledge Server: http://192.168.1.178:8768 (SSE)
 - Requested by: Andrew (project owner)
 
 ## Role
@@ -69,8 +69,26 @@ Session Logger. I maintain memory, decisions, and logs for the team.
 - PM server board noted: `self-service-registration` remains `in_progress` — Dom audit pending; `backward-compat`, `github-issues-sync`, `scribe-pm-logging` tasks logged
 - **No git commit** — awaiting Dom security audit completion
 
+### 2026-04-02 — MCP config consolidation + agent registration logging session
+
+**Actions taken this session:**
+- Created `.squad/orchestration-log/20260402T031500Z-coordinator.md` documenting MCP config consolidation, firewall setup, coordinator profile creation, and agent deployment
+- Created `.squad/log/20260402T031500Z-mcp-config-agents.md` documenting configuration changes and agent registration workflow
+- Updated squad knowledge server references in `team.md` and this history.md from old endpoint to http://192.168.1.178:8768
+- Verified OPM_BEARER_TOKEN in registry (43 chars) — pending process env injection after CLI restart
+- Confirmed all 4 MCP configs updated to SSE HTTP transport
+- Confirmed coordinator profile d77be8c deployed and all agent .agent.md files copied to ~/.copilot/agents/
+- No git commit this session (consolidated logs pending final review)
+
+**Process observations:**
+- Bearer token injection requires Copilot CLI restart to propagate to new process environments
+- All agent profiles successfully registered in centralized ~/.copilot/agents/ directory for CLI discovery
+- Squad-knowledge endpoint now unified across all MCP clients
+
 ## Learnings
 
 - Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)
 - Inbox files in `.squad/decisions/inbox/` must be merged into `decisions.md` and then deleted after each session
 - New squad members (Trenton, Mobley) hired as specialists to review before implementation — caught 7 bugs pre-code
+- MCP config consolidation: Update all endpoint references and test bearer token propagation immediately after CLI restart
+- Agent profile deployment: Always validate files are present in ~/.copilot/agents/ after copying from repository
