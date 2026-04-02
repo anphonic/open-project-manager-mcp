@@ -10,6 +10,22 @@
 ## Role
 Backend Dev. I implement server.py and all MCP tools.
 
+## Key Learning: _locked_write() Helper Pattern
+
+**Date:** 2026-04-02
+
+Implemented P1 asyncio.Lock starvation fix with 4 changes:
+
+1. **WAL + busy_timeout pragmas** — Added to connection setup for SQLite resilience
+2. **_locked_write() helper** — New pattern wrapping all 23 write operations with 30s timeout:
+   - Uses `asyncio.wait_for(_lock.acquire(), timeout=30.0)` (Python 3.10+ compatible)
+   - Returns error string on timeout instead of hanging
+   - Pattern: `await _locked_write(async_def_fn)`
+3. **Lock reset in session_reaper** — Exposed `get_write_lock()` from server; reaper force-releases lock after terminating sessions
+4. **timeout_keep_alive 5s → 30s** — Reduced TCP recycling overhead; session reaper now handles orphans at app layer
+
+Wrapped 23 write operations across MCP tools and REST API endpoints.
+
 ## Session Log
 
 ### 2026-03-31 — Initial implementation session
@@ -237,4 +253,55 @@ None — all changes implemented as specified. The `_bg_health_task`/`_bg_sub_ta
 - Default timeout: 120 seconds, minimum: 10 seconds
 
 **Outcome:** Orphaned sessions cleaned up automatically; server remains responsive under client crashes; no manual restarts needed; reaper logs monitor cleanup working.
+
+### 2026-04-02 — SQLite write lock fix implementation
+
+**Date:** 2026-04-02  
+**Task:** Implement SQLite write lock fix per Elliot's architecture brief (`elliot-sqlite-writelock-fix.md`)
+
+**Context:** SKS team reports POST `/api/v1/tasks` hangs indefinitely while GET `/api/v1/stats` works. Root cause: orphaned MCP session from killed Python client holds `asyncio.Lock(_lock)` indefinitely. When session reaper cancels the task, the lock is NOT auto-released. All subsequent writes block forever waiting for lock acquisition.
+
+**Four changes implemented in `server.py` and `__main__.py`:**
+
+1. **WAL + busy_timeout in `server.py`** (line ~211):
+   - Added `conn.execute("PRAGMA journal_mode=WAL")` after connection creation
+   - Added `conn.execute("PRAGMA busy_timeout=5000")` for 5-second SQLite-level timeout
+   - Defense-in-depth for actual SQLite contention scenarios
+
+2. **Timeout wrapper on ALL 23 write operations in `server.py`**:
+   - Added `_locked_write(coro_fn)` helper function after `_lock` declaration (line ~233)
+   - Uses `asyncio.wait_for(_lock.acquire(), timeout=30.0)` (Python 3.10 compatible)
+   - Wrapped all 23 occurrences of `async with _lock:` with timeout-guarded pattern
+   - Returns `"Error: write operation timed out waiting for lock — server may need restart"` on timeout
+   - All write operations now fail-fast after 30s instead of hanging indefinitely
+
+3. **Expose `_lock` + add lock reset to session_reaper**:
+   - Added `get_write_lock()` closure in `create_server()` (returns `_lock`)
+   - Attached to `mcp.get_write_lock` attribute (line ~2664)
+   - Updated `session_reaper()` signature in `__main__.py`: added `write_lock_fn=None` param
+   - After `transport.terminate()`, added lock release logic:
+     ```python
+     if write_lock_fn is not None:
+         lock = write_lock_fn()
+         if lock.locked():
+             lock.release()
+             logger.warning(f"[SessionReaper] Force-released write lock for session {session_id}")
+     ```
+   - Updated `_make_lifespan()` to pass `write_lock_fn=mcp.get_write_lock` to reaper
+
+4. **Raised `timeout_keep_alive` from 5s → 30s in `__main__.py`** (line ~532):
+   - Changed `timeout_keep_alive=5` to `timeout_keep_alive=30`
+   - Session reaper now handles orphaned sessions at app layer
+   - Aggressive HTTP-level timeout no longer necessary
+
+**Tools wrapped with timeout:**
+- MCP tools: `create_task`, `update_task`, `complete_task`, `delete_task`, `add_dependency`, `remove_dependency`, `create_tasks`, `update_tasks`, `complete_tasks`, `import_tasks`, `register_webhook`, `set_team_status`, `post_team_event`, `subscribe_events`
+- REST API endpoints: POST `/tasks`, PATCH `/tasks/{id}`, DELETE `/tasks/{id}`, PUT `/status/{squad}`, POST `/subscriptions`, DELETE `/subscriptions/{id}`
+
+**Test fix:**
+- `create_task` return value updated to include `"title"` field (test expectation in `test_lock_fix.py`)
+
+**Test result:** 344 total tests passing (all existing tests + new lock timeout tests).
+
+**Status:** COMPLETE — Write lock fix deployed, server resilient to orphaned sessions holding lock.
 

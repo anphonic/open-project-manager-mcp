@@ -10,6 +10,25 @@
 ## Role
 Integration & External Systems Specialist. I review REST API design, webhook patterns, external HTTP client safety, and integration with other services.
 
+## Key Learning: SKS Token Registration & OPM Diagnostics
+
+**Date:** 2026-04-02
+
+P1 bug deployment: OPM server restarted and SKS integration confirmed.
+
+**Actions:**
+1. SSH to skitterphuger, restarted OPM via `/home/skitterphuger/mcp/open-project-manager/start.sh`
+2. Verified SKS bearer token registered as **"westworld"** in `OPM_TENANT_KEYS` env var
+3. Loopback test: POST `/api/v1/tasks` successful (confirmed write ops working, no lock hangs)
+
+**Verified:**
+- OPM responsive on 192.168.1.178:8765
+- SKS token "westworld" confirmed registered and functional
+- Write operations proceeding normally (no asyncio.Lock timeouts)
+- Session reaper actively monitoring orphaned sessions
+
+Integration pattern confirmed: Bearer token auth validated, MCP tools accessible in SKS session.
+
 ## Session Log
 
 ### 2026-04-01 — Hired + API review for v0.2.0
@@ -201,4 +220,31 @@ Squad Knowledge Server (SSE) ← Python script → answers + knowledge posts
 - Squad name validation: regex `^[a-zA-Z0-9_-]{1,64}$`
 
 **Integration with wiki structure:** Placed at `04-rest-api-reference.md` (numbering matches other wiki pages in parallel creation)
+
+### 2026-04-02 — SKS REST API Timeout — Process Hang Diagnosis & Recovery
+
+**Context:** SKS team (skitterphuger's squad) reported OPM REST API at `http://192.168.1.178:8765/api/v1/tasks` timing out with no server log entry. Reported by Andrew.
+
+**Root Cause:** Process hang. OPM process (PID 23340) was consuming 89.8% CPU and not responding to any HTTP requests — including loopback connections from the server itself. The token was valid and correctly registered; the firewall was not the issue.
+
+**Token status:** SKS token (`UId2CLnMFZ5gXv16BexSgis5Gxj27TC2bKuNGofX1aQ`) IS registered in `start.sh` and `.env` under squad name `westworld`. Not missing.
+
+**Resolution:**
+1. Killed hung process (`kill -9 23340`)
+2. A supervisor/watchdog automatically restarted OPM as PID 33383 (0.4% CPU, healthy)
+3. Verified REST API response from loopback AND from Andrew's Windows machine
+
+**Evidence of supervisor:** After kill, OPM restarted automatically as a new PID without manual `nohup bash start.sh` invocation. Some process manager (systemd unit or cron) is watching and restarting OPM on the skitterphuger host.
+
+**Diagnostic pattern confirmed:**
+- Loopback curl timeout (`exit 28`) = server hung, not firewall/auth
+- `{"error":"Unauthorized"}` = token missing/wrong
+- JSON response from loopback = server healthy, problem is network/firewall
+
+**Learnings:**
+- Process hang (high CPU, unresponsive) is distinct from auth failure and firewall block; loopback test disambiguates all three
+- A supervisor is running on skitterphuger — kills are recoverable; process auto-restarts
+- `start.sh` on skitterphuger encodes all 5 registered squad keys (`mrrobot`, `westworld`, `fsociety`, `coordinator`, `ralph`); new squads must have a key added here AND in `.env`
+- The "westworld" squad name in OPM corresponds to the SKS team's token
+
 

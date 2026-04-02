@@ -10,6 +10,26 @@
 ## Role
 Lead & Architect. I own design decisions and ensure consistency with squad-knowledge-mcp patterns.
 
+## Key Learning: asyncio.Lock Starvation Root Cause
+
+**Date:** 2026-04-02
+
+P1 bug root cause confirmed: **asyncio.Lock starvation**, NOT SQLite write lock.
+
+- Single `_lock = asyncio.Lock()` guards ALL 23 write operations (server.py line 231)
+- When session reaper terminates abandoned sessions, if a task held the lock, Python does NOT auto-release it
+- Lock remains acquired indefinitely
+- All subsequent write operations block indefinitely
+- Reads work (don't use lock); writes hang (wait on lock)
+
+**Design decision:** 4-part fix:
+1. WAL + busy_timeout pragmas (defense-in-depth)
+2. 30s timeout wrapper on all 23 write ops
+3. Lock reset in session_reaper after terminating sessions
+4. Raise timeout_keep_alive from 5s → 30s
+
+This root cause analysis confirmed the app-level lock contention was the real problem, not database-level issues.
+
 ## Session Log
 
 ### 2026-03-31 — Architecture review (v0.1.0 review round)
@@ -245,3 +265,44 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 - Lock contention (`_session_creation_lock`) creates cascading timeouts
 - Server process appears healthy (running, logging stopped) but unresponsive
 - Symptom: new requests timeout with no log entries = task starvation
+
+### 2026-04-02 — asyncio.Lock write starvation bug (P1)
+
+**Task:** Root cause analysis of POST hang reported by SKS team.
+
+**Symptom:** GET `/api/v1/stats` works; POST `/api/v1/tasks` hangs with 0 bytes received. Orphaned session `3ad3f83ae79f46668996fd3a8a94e1b0` from killed Python client suspected.
+
+**Root cause:** NOT SQLite write lock — it's **asyncio.Lock starvation**:
+- Single `_lock = asyncio.Lock()` guards all 23 write operations (line 231)
+- Session reaper terminates asyncio task but does NOT release held lock
+- `asyncio.Lock` does NOT auto-release on task cancellation
+- Result: `_lock` stays acquired forever, all writes hang
+
+**Key finding:** SQLite connection management is fine:
+- `check_same_thread=False` allows event loop sharing
+- All writes have `conn.commit()`
+- No WAL or busy_timeout set (but not the root cause)
+
+**Fix designed:**
+1. Add 30s timeout to all `async with _lock:` blocks
+2. Expose lock via `get_write_lock()`, reset in reaper
+3. Add WAL + busy_timeout as defense-in-depth
+4. Raise `timeout_keep_alive` 5s → 30s (reaper makes aggressive timeout unnecessary)
+
+**Deliverable:** `.squad/decisions/inbox/elliot-sqlite-writelock-fix.md`
+
+**Immediate mitigation:** Server restart releases orphaned lock
+
+## Learnings
+
+### asyncio.Lock cancellation semantics
+- `asyncio.Lock` does NOT auto-release when holding task is cancelled
+- Unlike threading.Lock (which releases on thread death), asyncio locks persist
+- Must explicitly release or timeout when task cancellation is possible
+- Pattern: always use `async with asyncio.timeout(N):` around lock acquisition in cancellable contexts
+
+### Distinguishing SQLite vs app-level locks
+- SQLite implicit transactions auto-rollback on connection close
+- SQLite WAL allows concurrent reads but serializes writes
+- App-level asyncio.Lock is independent — can block even when SQLite is free
+- Symptom analysis: if SELECTs work but INSERTs hang, check app locks first

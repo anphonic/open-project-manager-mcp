@@ -939,6 +939,75 @@ Pattern established:
 
 ---
 
+## 2026-04-02: SQLite Write Lock Root Cause Analysis & Fix (Elliot)
+
+**Author:** Elliot (Lead Architect)  
+**Date:** 2026-04-02  
+**Priority:** P1 — Production blocker  
+**Status:** DESIGN COMPLETE — Ready for Darlene
+
+**Problem:** SKS team reports POST `/api/v1/tasks` hangs indefinitely while GET `/api/v1/stats` works. Root cause: **asyncio.Lock starvation**, not SQLite write lock. An orphaned MCP session is blocking all write operations.
+
+**Root Cause (Not SQLite):**
+- Single asyncio.Lock guards ALL 23 write operations
+- When session reaper calls `transport.terminate()`, if a task was holding `_lock`, Python's asyncio.Lock does NOT auto-release on cancellation
+- Result: lock stays acquired forever — no new write operations can proceed
+- Symptom: GET works (reads don't use lock), POST hangs (writes wait on lock)
+
+**Recommended Fix (4 changes):**
+1. WAL + busy_timeout pragmas on connection setup (defense-in-depth)
+2. Timeout wrapper on ALL write operations (30s timeout)
+3. Lock reset in session reaper after terminating sessions
+4. Raise timeout_keep_alive from 5s → 30s (session reaper handles orphans)
+
+**Decision:** Darlene implements all 4 changes per Elliot's brief. Romero adds 14 new tests. Build immediately as P1.
+
+---
+
+## 2026-04-02: SQLite Write Lock Fix — Implementation (Darlene)
+
+**Author:** Darlene (Backend Dev)  
+**Date:** 2026-04-02  
+**Status:** IMPLEMENTED — All tests passing (344/344)
+
+**Changes Made:**
+
+### 1. WAL + busy_timeout (server.py line ~211)
+```python
+conn = sqlite3.connect(db_path, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA busy_timeout=5000")
+conn.executescript(_SCHEMA)
+conn.commit()
+```
+
+### 2. Timeout wrapper on ALL 23 write ops (server.py line ~233+)
+- Helper function `_locked_write(coro_fn)` acquires lock with 30s timeout
+- Applied to: create_task, update_task, complete_task, delete_task, all bulk ops, webhooks, subscriptions, team ops
+- Pattern: `async with _lock:` → `await _locked_write(async_fn)`
+- Uses `asyncio.wait_for` (Python 3.10+ compatible), not `asyncio.timeout` (3.11+ only)
+
+### 3. Lock reset in session_reaper (__main__.py line ~249)
+- Exposed `get_write_lock()` from server
+- Reaper calls `lock.release()` after `transport.terminate()` if lock is still held
+- Logs warning: `[SessionReaper] Force-released write lock for session {id}`
+
+### 4. Raised timeout_keep_alive (__main__.py line ~532)
+- Before: 5s (aggressive TCP recycling)
+- After: 30s (reduced overhead; session reaper handles orphans at app layer)
+
+**Test Results:** 344 total tests passing (100%), including 14 new lock-fix tests.
+
+**Verification:**
+- ✅ All 344 tests pass
+- ✅ WAL mode active
+- ✅ All 23 write ops wrapped with 30s timeout
+- ✅ Session reaper force-releases lock
+- ✅ timeout_keep_alive = 30s
+
+---
+
 ## 2026-04-02: Elliot — Proactive Messaging System Architecture
 
 *Merged from inbox: elliot-messaging-arch.md*

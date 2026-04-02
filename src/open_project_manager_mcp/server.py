@@ -208,6 +208,8 @@ def create_server(
     """Create and return the project manager MCP server backed by SQLite at db_path."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
     conn.commit()
 
@@ -233,6 +235,17 @@ def create_server(
     _event_bus_clients: list[asyncio.Queue] = []
     _bg_health_task: Optional[asyncio.Task] = None
     _bg_sub_task: Optional[asyncio.Task] = None
+
+    async def _locked_write(coro_fn):
+        """Acquire _lock with 30s timeout, run coro_fn(), release. Returns error string on timeout."""
+        try:
+            await asyncio.wait_for(_lock.acquire(), timeout=30.0)
+        except asyncio.TimeoutError:
+            return "Error: write operation timed out waiting for lock — server may need restart"
+        try:
+            return await coro_fn()
+        finally:
+            _lock.release()
 
     def _verify_bearer(token: str) -> str | None:
         """Return tenant_id if token is valid, else None. Env var keys take precedence."""
@@ -688,7 +701,8 @@ def create_server(
         actor = _get_actor()
         now = _now()
         tags_json = json.dumps(tags) if tags else None
-        async with _lock:
+        
+        async def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO tasks"
@@ -698,10 +712,15 @@ def create_server(
                 )
                 _log(id, "created", actor=actor)
                 conn.commit()
+                return None
             except sqlite3.IntegrityError:
                 return f"Error: task '{id}' already exists"
             except sqlite3.Error:
                 return "Error: database error creating task"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         asyncio.create_task(
             _fire_webhooks(
                 "task.created",
@@ -715,7 +734,7 @@ def create_server(
             "status": "pending", "project": project,
         })
         _publish_queue_stats()
-        return json.dumps({"id": id, "status": "pending", "priority": priority, "project": project})
+        return json.dumps({"id": id, "title": title, "status": "pending", "priority": priority, "project": project})
 
     @mcp.tool()
     async def update_task(
@@ -759,7 +778,8 @@ def create_server(
         if unknown:
             return f"Error: internal error — unknown field(s): {', '.join(sorted(unknown))}"
         actor = _get_actor()
-        async with _lock:
+        
+        async def _do_write():
             old_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if old_row is None:
                 return f"Error: task '{task_id}' not found"
@@ -776,8 +796,16 @@ def create_server(
                     if old_val != new_val:
                         _log(task_id, "updated", field=field, old_value=old_val, new_value=new_val, actor=actor)
                 conn.commit()
+                return None
             except sqlite3.Error:
                 return "Error: database error updating task"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
+        
+        old_data = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        old_data = dict(old_data) if old_data else {}
         task_project = updates.get("project") or old_data.get("project", "default")
         asyncio.create_task(
             _fire_webhooks("task.updated", task_id, task_project, {"id": task_id, "updated": list(updates.keys())})
@@ -792,7 +820,8 @@ def create_server(
     async def complete_task(task_id: str) -> str:
         """Mark a task as done."""
         actor = _get_actor()
-        async with _lock:
+        
+        async def _do_write():
             old_row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if old_row is None:
                 return f"Error: task '{task_id}' not found"
@@ -805,6 +834,12 @@ def create_server(
             conn.commit()
             if cur.rowcount == 0:
                 return f"Error: task '{task_id}' not found"
+            return task_project
+        
+        result = await _locked_write(_do_write)
+        if isinstance(result, str) and result.startswith("Error"):
+            return result
+        task_project = result
         asyncio.create_task(
             _fire_webhooks("task.completed", task_id, task_project, {"id": task_id, "status": "done"})
         )
@@ -818,7 +853,8 @@ def create_server(
         if not human_approval:
             return "Error: human_approval=True is required to delete a task"
         actor = _get_actor()
-        async with _lock:
+        
+        async def _do_write():
             row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
                 return f"Error: task '{task_id}' not found"
@@ -832,6 +868,12 @@ def create_server(
             conn.commit()
             if cur.rowcount == 0:
                 return f"Error: task '{task_id}' not found"
+            return task_project
+        
+        result = await _locked_write(_do_write)
+        if isinstance(result, str) and result.startswith("Error"):
+            return result
+        task_project = result
         asyncio.create_task(
             _fire_webhooks("task.deleted", task_id, task_project, {"id": task_id})
         )
@@ -922,7 +964,8 @@ def create_server(
         if task_id == depends_on_id:
             return "Error: a task cannot depend on itself"
         actor = _get_actor()
-        async with _lock:
+        
+        async def _do_write():
             if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
                 return f"Error: task '{task_id}' not found"
             if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (depends_on_id,)).fetchone():
@@ -934,15 +977,21 @@ def create_server(
                 )
                 _log(task_id, "dep_added", field="depends_on", new_value=depends_on_id, actor=actor)
                 conn.commit()
+                return None
             except sqlite3.IntegrityError:
                 return "Dependency already exists"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"task_id": task_id, "depends_on": depends_on_id})
 
     @mcp.tool()
     async def remove_dependency(task_id: str, depends_on_id: str) -> str:
         """Remove a dependency edge between two tasks."""
         actor = _get_actor()
-        async with _lock:
+        
+        async def _do_write():
             cur = conn.execute(
                 "DELETE FROM task_deps WHERE task_id = ? AND depends_on = ?",
                 (task_id, depends_on_id),
@@ -951,6 +1000,11 @@ def create_server(
                 return "Error: dependency not found"
             _log(task_id, "dep_removed", field="depends_on", old_value=depends_on_id, actor=actor)
             conn.commit()
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"task_id": task_id, "depends_on": depends_on_id, "removed": True})
 
     @mcp.tool()
@@ -1087,7 +1141,8 @@ def create_server(
         if message and len(message) > _MAX_SHORT_FIELD:
             return f"Error: 'message' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
         now = _now()
-        async with _lock:
+        
+        async def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO team_status (squad, status, message, updated_at)"
@@ -1097,8 +1152,13 @@ def create_server(
                     (squad, status, message, now),
                 )
                 conn.commit()
+                return None
             except sqlite3.Error:
                 return "Error: database error setting team status"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         _publish_event("squad.status", {"squad": squad, "status": status, "message": message})
         return json.dumps({"squad": squad, "status": status, "message": message, "updated_at": now})
 
@@ -1131,15 +1191,21 @@ def create_server(
         if data and len(data) > _MAX_DESCRIPTION:
             return f"Error: 'data' exceeds maximum length of {_MAX_DESCRIPTION} characters"
         now = _now()
-        async with _lock:
+        
+        async def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO team_events (squad, event_type, data, created_at) VALUES (?, ?, ?, ?)",
                     (squad, event_type, data, now),
                 )
                 conn.commit()
+                return None
             except sqlite3.Error:
                 return "Error: database error posting team event"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         _publish_event(event_type, {"squad": squad, "data": data})
         return json.dumps({"squad": squad, "event_type": event_type, "created_at": now})
 
@@ -1196,7 +1262,8 @@ def create_server(
         if interval_sec is not None:
             if interval_sec < _SUB_MIN_INTERVAL or interval_sec > _SUB_MAX_INTERVAL:
                 return f"Error: interval_sec must be between {_SUB_MIN_INTERVAL} and {_SUB_MAX_INTERVAL}"
-        async with _lock:
+        
+        async def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO event_subscriptions"
@@ -1205,10 +1272,15 @@ def create_server(
                     (id, subscriber, url, event_type, project, interval_sec, _now()),
                 )
                 conn.commit()
+                return None
             except sqlite3.IntegrityError:
                 return f"Error: subscription '{id}' already exists"
             except sqlite3.Error:
                 return "Error: database error creating subscription"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         _ensure_bg_sub_task()
         return json.dumps({
             "id": id, "subscriber": subscriber, "event_type": event_type,
@@ -1385,7 +1457,8 @@ def create_server(
         actor = _get_actor()
         created: list[str] = []
         errors: list[dict] = []
-        async with _lock:
+        
+        async def _do_write():
             for item in tasks:
                 tid = item.get("id", "")
                 err = _validate_create_params(
@@ -1438,6 +1511,11 @@ def create_server(
                 except sqlite3.Error as exc:
                     errors.append({"id": tid, "error": f"Error: database error: {exc}"})
             conn.commit()
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"created": created, "errors": errors})
 
     @mcp.tool()
@@ -1448,7 +1526,8 @@ def create_server(
         actor = _get_actor()
         updated: list[str] = []
         errors: list[dict] = []
-        async with _lock:
+        
+        async def _do_write():
             for item in updates:
                 task_id = item.get("task_id", "")
                 if not task_id:
@@ -1499,6 +1578,11 @@ def create_server(
                 except sqlite3.Error as exc:
                     errors.append({"id": task_id, "error": f"Error: database error: {exc}"})
             conn.commit()
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"updated": updated, "errors": errors})
 
     @mcp.tool()
@@ -1512,7 +1596,8 @@ def create_server(
         actor = _get_actor()
         completed: list[str] = []
         not_found: list[str] = []
-        async with _lock:
+        
+        async def _do_write():
             for task_id in ids:
                 row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if row is None:
@@ -1525,6 +1610,11 @@ def create_server(
                 _log(task_id, "completed", actor=actor)
                 completed.append(task_id)
             conn.commit()
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"completed": completed, "not_found": not_found})
 
     # ------------------------------------------------------------------
@@ -1647,7 +1737,9 @@ def create_server(
         imported = 0
         skipped = 0
         errs: list[dict] = []
-        async with _lock:
+        
+        async def _do_write():
+            nonlocal imported, skipped
             if not merge:
                 conflicts = [
                     t["id"]
@@ -1711,6 +1803,11 @@ def create_server(
                 except sqlite3.Error:
                     pass
             conn.commit()
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"imported": imported, "skipped": skipped, "errors": errs})
 
     # ------------------------------------------------------------------
@@ -1743,7 +1840,8 @@ def create_server(
         invalid_events = set(events) - VALID_WEBHOOK_EVENTS
         if invalid_events:
             return f"Error: invalid events: {', '.join(sorted(invalid_events))}. Valid: {', '.join(sorted(VALID_WEBHOOK_EVENTS))}"
-        async with _lock:
+        
+        async def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO webhooks (id, url, project, events, secret, enabled, created_at)"
@@ -1751,10 +1849,15 @@ def create_server(
                     (id, url, project, json.dumps(events), secret, _now()),
                 )
                 conn.commit()
+                return None
             except sqlite3.IntegrityError:
                 return f"Error: webhook '{id}' already exists"
             except sqlite3.Error:
                 return "Error: database error registering webhook"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"id": id, "url": url, "events": events, "project": project})
 
     @mcp.tool()
@@ -1935,7 +2038,8 @@ def create_server(
                     if tags_err:
                         return JSONResponse({"error": tags_err}, status_code=400)
                     tags_json = json.dumps(tags) if tags else None
-                    async with _lock:
+                    
+                    async def _do_write():
                         try:
                             conn.execute(
                                 "INSERT INTO tasks"
@@ -1949,10 +2053,15 @@ def create_server(
                             )
                             _log(tid, "created", actor=actor)
                             conn.commit()
+                            return None
                         except sqlite3.IntegrityError:
                             return JSONResponse({"error": f"Error: task '{tid}' already exists"}, status_code=409)
                         except sqlite3.Error:
                             return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    
+                    result = await _locked_write(_do_write)
+                    if result:
+                        return result
                     t_project = body.get("project", "default")
                     t_priority = body.get("priority", "medium")
                     _publish_event("task.created", {
@@ -2015,7 +2124,8 @@ def create_server(
                         upd["tags"] = json.dumps(body["tags"])
                     if not upd:
                         return JSONResponse({"error": "Error: no fields to update"}, status_code=400)
-                    async with _lock:
+                    
+                    async def _do_write():
                         old_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
                         if old_row is None:
                             return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
@@ -2032,8 +2142,14 @@ def create_server(
                                 if old_val != new_val:
                                     _log(task_id, "updated", field=field, old_value=old_val, new_value=new_val, actor=actor)
                             conn.commit()
+                            return old_data
                         except sqlite3.Error:
                             return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    
+                    result = await _locked_write(_do_write)
+                    if isinstance(result, JSONResponse):
+                        return result
+                    old_data = result
                     task_project_patch = upd.get("project") or old_data.get("project", "default")
                     _publish_event("task.updated", {
                         "id": task_id, "updated": list(upd.keys()), "project": task_project_patch,
@@ -2044,8 +2160,8 @@ def create_server(
                     confirm = request.query_params.get("confirm", "").lower() == "true"
                     if not confirm:
                         return JSONResponse({"error": "Error: confirm=true is required to delete a task"}, status_code=400)
-                    task_project_del = "default"
-                    async with _lock:
+                    
+                    async def _do_write():
                         row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
                         if row is None:
                             return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
@@ -2056,6 +2172,12 @@ def create_server(
                         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
                         _log(task_id, "deleted", actor=actor)
                         conn.commit()
+                        return task_project_del
+                    
+                    result = await _locked_write(_do_write)
+                    if isinstance(result, JSONResponse):
+                        return result
+                    task_project_del = result
                     _publish_event("task.deleted", {"id": task_id, "project": task_project_del})
                     _publish_queue_stats()
                     return JSONResponse({"id": task_id, "deleted": True})
@@ -2457,7 +2579,8 @@ def create_server(
                                 {"error": f"Error: interval_sec must be between {_SUB_MIN_INTERVAL} and {_SUB_MAX_INTERVAL}"},
                                 status_code=400,
                             )
-                    async with _lock:
+                    
+                    async def _do_write():
                         try:
                             conn.execute(
                                 "INSERT INTO event_subscriptions"
@@ -2466,10 +2589,15 @@ def create_server(
                                 (sub_id, subscriber, url, event_type, project, interval_sec, _now()),
                             )
                             conn.commit()
+                            return None
                         except sqlite3.IntegrityError:
                             return JSONResponse({"error": f"Error: subscription '{sub_id}' already exists"}, status_code=409)
                         except sqlite3.Error:
                             return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    
+                    result = await _locked_write(_do_write)
+                    if result:
+                        return result
                     _ensure_bg_sub_task()
                     return JSONResponse(
                         {"id": sub_id, "subscriber": subscriber, "event_type": event_type,
@@ -2500,11 +2628,17 @@ def create_server(
                     confirm = request.query_params.get("confirm", "").lower() == "true"
                     if not confirm:
                         return JSONResponse({"error": "Error: confirm=true is required"}, status_code=400)
-                    async with _lock:
+                    
+                    async def _do_write():
                         cur = conn.execute("DELETE FROM event_subscriptions WHERE id = ?", (sub_id,))
                         conn.commit()
                         if cur.rowcount == 0:
                             return JSONResponse({"error": f"Error: subscription '{sub_id}' not found"}, status_code=404)
+                        return None
+                    
+                    result = await _locked_write(_do_write)
+                    if result:
+                        return result
                     return JSONResponse({"id": sub_id, "deleted": True})
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
@@ -2526,5 +2660,11 @@ def create_server(
             ])
 
         mcp._rest_router = _build_rest_router()
+    
+    def get_write_lock() -> asyncio.Lock:
+        """Return the write lock for external monitoring/recovery."""
+        return _lock
+    
+    mcp.get_write_lock = get_write_lock
 
     return mcp

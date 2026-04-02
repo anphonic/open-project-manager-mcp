@@ -455,8 +455,9 @@ def main():
                     # Start session reaper task if in HTTP mode with session tracking
                     reaper_task = None
                     if session_manager is not None and tracker is not None:
+                        write_lock_fn = getattr(mcp, 'get_write_lock', None)
                         reaper_task = asyncio.create_task(
-                            session_reaper(session_manager, tracker, check_interval=30)
+                            session_reaper(session_manager, tracker, check_interval=30, write_lock_fn=write_lock_fn)
                         )
                         logging.getLogger("opm.session_reaper").info(
                             f"[SessionReaper] Started with {tracker.session_timeout}s timeout"
@@ -528,7 +529,7 @@ def main():
             host=host,
             port=port,
             log_level="info",
-            timeout_keep_alive=5,
+            timeout_keep_alive=30,
             limit_concurrency=max_connections,
             limit_max_requests=1000,
             timeout_graceful_shutdown=10,
