@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sys
+import time
 
 import platformdirs
 
@@ -77,6 +78,59 @@ class _FixArgumentsMiddleware:
                 return {"type": "http.request", "body": b"", "more_body": False}
 
         await self.app(scope, patched_receive, original_send)
+
+
+class ConnectionTimeoutMiddleware:
+    """Kill connections that have been open longer than max_connection_age seconds.
+    
+    This middleware prevents event loop saturation from long-lived SSE connections
+    by forcibly closing connections that exceed a configurable age threshold.
+    """
+
+    def __init__(self, app, max_connection_age: int = 60):
+        self.app = app
+        self.max_connection_age = max_connection_age
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        
+        start_time = time.monotonic()
+        response_started = False
+        
+        async def timeout_aware_receive():
+            elapsed = time.monotonic() - start_time
+            if elapsed > self.max_connection_age:
+                import logging
+                logging.warning(
+                    f"[ConnectionTimeoutMiddleware] Killed connection after {elapsed:.1f}s"
+                )
+                return {"type": "http.disconnect"}
+            return await receive()
+        
+        async def timeout_aware_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+        
+        try:
+            await self.app(scope, timeout_aware_receive, timeout_aware_send)
+        except Exception:
+            elapsed = time.monotonic() - start_time
+            if elapsed > self.max_connection_age and not response_started:
+                await send({
+                    "type": "http.response.start",
+                    "status": 408,
+                    "headers": [(b"content-type", b"text/plain")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b"Connection timeout",
+                })
+            else:
+                raise
 
 
 def _load_tenant_keys() -> dict[str, dict[str, object]] | None:
@@ -200,6 +254,11 @@ def main():
         help="Mount REST API at /api/v1 (HTTP mode only). Requires --http.",
     )
     parser.add_argument(
+        "--connection-timeout",
+        type=int,
+        help="Max connection age in seconds before forced disconnect (env: OPM_CONNECTION_TIMEOUT, default: 60)",
+    )
+    parser.add_argument(
         "--generate-token",
         type=str,
         metavar="SQUAD_NAME",
@@ -237,6 +296,16 @@ def main():
     if max_connections < 1:
         print(
             f"FATAL: --max-connections must be at least 1 (got {max_connections})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    
+    connection_timeout = int(
+        args.connection_timeout or os.environ.get("OPM_CONNECTION_TIMEOUT", "60")
+    )
+    if connection_timeout < 5:
+        print(
+            f"FATAL: --connection-timeout must be at least 5 seconds (got {connection_timeout})",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -309,6 +378,7 @@ def main():
                     lifespan=_make_lifespan(mcp_asgi),
                 )
             app = _FixArgumentsMiddleware(app)
+            app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
         else:
             print(
                 f"Starting open-project-manager-mcp in SSE mode on {host}:{port}\n"
@@ -317,21 +387,29 @@ def main():
                 file=sys.stderr,
             )
             mcp_sse_asgi = mcp.sse_app()
-            app = Starlette(
-                routes=[Mount("/", mcp_sse_asgi)],
-                lifespan=_make_lifespan(mcp_sse_asgi),
-            )
+            if args.rest_api and hasattr(mcp, "_rest_router"):
+                print("  REST API mounted at /api/v1", file=sys.stderr)
+                app = Starlette(
+                    routes=[Mount("/api/v1", app=mcp._rest_router), Mount("/", mcp_sse_asgi)],
+                    lifespan=_make_lifespan(mcp_sse_asgi),
+                )
+            else:
+                app = Starlette(
+                    routes=[Mount("/", mcp_sse_asgi)],
+                    lifespan=_make_lifespan(mcp_sse_asgi),
+                )
             app = _FixArgumentsMiddleware(app)
+            app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
 
         uvicorn.run(
             app,
             host=host,
             port=port,
             log_level="info",
-            timeout_keep_alive=30,
+            timeout_keep_alive=5,
             limit_concurrency=max_connections,
-            limit_max_requests=10000,
-            timeout_graceful_shutdown=30,
+            limit_max_requests=1000,
+            timeout_graceful_shutdown=10,
         )
     else:
         asyncio.run(mcp.run_stdio_async())

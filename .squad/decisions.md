@@ -46,6 +46,144 @@
 
 ---
 
+## 2026-04-02: OPM Transport Stability (Elliot)
+
+**Author:** Elliot (Lead & Architect)  
+**Status:** APPROVED  
+**Priority:** P0 — Production stability
+
+**Problem:** OPM in `--http` mode on skitterphuger exhibits critical recurring stability: uvicorn accepts TCP connections but stops responding to HTTP requests within minutes under load; CPU spikes to 77%+; SSH to server hangs (kernel-level event loop saturation); process must be manually killed/restarted.
+
+**Root Cause:** FastMCP does not implement session timeouts. MCP clients hold SSE connections open indefinitely (observed 16+ minutes), saturating the event loop until server becomes completely unresponsive.
+
+**Options Evaluated:**
+1. **Monitor + Restart (Watchdog):** Fast to implement, zero code changes. Con: Symptom mitigation, not root cause fix; downtime window between detection and recovery.
+2. **Stale Connection Killer (Middleware/uvicorn tuning):** Targets actual problem. Con: Complex to implement correctly; uvicorn's `timeout_keep_alive=30` already set but only applies between requests, not to active SSE streams.
+3. **Migrate to SSE:** SSE is deprecated in favor of streamable-HTTP (spec 2025-03-26). Con: Going backwards on protocol evolution; same fundamental problem.
+
+**Chosen Approach:** Hybrid — **Connection Timeout Middleware + uvicorn tuning + Watchdog** (Phase 1+2+3).
+
+**Phase 1 (Darlene):** Aggressive Connection Recycling
+- Reduce `timeout_keep_alive` to 5 seconds (force TCP connection recycling after each request burst)
+- Reduce `limit_max_requests` to 1000 (force worker recycling more frequently)
+- Set `timeout_graceful_shutdown=10`
+
+**Phase 2 (Darlene):** Connection Timeout Middleware
+- Add ASGI middleware to track connection age via `time.monotonic()`
+- Forcibly close connections exceeding threshold (configurable, default 60 seconds)
+- Wraps `receive()` — injects `http.disconnect` when elapsed > threshold
+- Wraps `send()` — tracks `response_started` to prevent double-response errors
+- Logs WARNING when connection killed
+- Only applies to HTTP scope (WebSocket/lifespan pass through)
+- New CLI argument: `--connection-timeout` (int, default 60, env `OPM_CONNECTION_TIMEOUT`), validation ≥5s
+
+**Phase 3 (Ops):** Watchdog Script (Defense in Depth)
+- Bash script polling `/api/v1/stats` every 30-60 seconds
+- Restart OPM if unresponsive
+- Last-resort recovery, not primary mitigation
+
+**Client Config Changes:** None. `"type": "http"` remains valid; changes are server-side only.
+
+**Success Criteria:**
+1. OPM remains responsive under sustained multi-agent load for 24+ hours without manual intervention
+2. No SSH lockups on skitterphuger
+3. Connection timeout warnings appear in logs but service stays up
+4. Watchdog reports zero restarts after Phase 2 stabilizes
+
+**Future:** File issue on FastMCP repo requesting native session timeouts; when implemented, remove custom middleware.
+
+---
+
+## 2026-04-02: Transport Analysis & REST API in SSE Mode (Mobley)
+
+**Author:** Samar Asif (Mobley)  
+**Context:** OPM crashes under load in `--http` mode; FastMCP's streamable-HTTP has no session timeouts.
+
+**Key Findings:**
+
+1. **SSE is viable but deprecated:** squad-knowledge-mcp runs SSE successfully. Both transports share same auth infrastructure (`ApiKeyVerifier`/`AuthSettings`). REST API (`/api/v1`) is transport-independent, mounted separately.
+
+2. **REST API not mounted in SSE mode (gap identified):** Currently REST API only mounted in `--http` mode. Proposed fix: Mount REST API in SSE mode too (mirroring HTTP mode pattern).
+
+3. **SSE endpoint structure:** Two-endpoint pattern — `/sse` (long-lived stream) and `/messages/` (client request POSTs). Copilot CLI client knows this convention automatically.
+
+4. **Authentication:** Both transports respect same auth infrastructure. SSE clients send `Authorization: Bearer <token>` headers; `ApiKeyVerifier` validates against `OPM_TENANT_KEYS`.
+
+5. **Transports are mutually exclusive:** `--http` and `--sse` use `add_mutually_exclusive_group()`. Only one transport can run per instance.
+
+6. **Client migration checklist:** Change `"type": "http"` → `"type": "sse"` and URL from `/mcp` endpoint to base URL. Keep Authorization header unchanged.
+
+7. **Watchdog approach:** Poll transport-independent REST API (`/api/v1/tasks?limit=1`) rather than SSE-specific endpoint (works with both `--http` and `--sse`).
+
+**Decision:** (Deferred to Elliot) Stick with `--http` mode + Connection Timeout Middleware (Phases 1+2) rather than full SSE migration. However, implement REST API mounting in SSE mode as defensive preparation for future migration.
+
+---
+
+## 2026-04-02: Implementation — Transport Stability Fix (Darlene)
+
+**Author:** Darlene (Backend Dev)  
+**Date:** 2026-04-02  
+**Status:** IMPLEMENTED  
+**Parent Decision:** Elliot's OPM Transport Stability decision
+
+**Changes Made:**
+
+### Phase 1: uvicorn Parameter Tuning
+
+Updated `uvicorn.run()` call in `__main__.py`:
+- `timeout_keep_alive=5` (was 30 — force connection recycling)
+- `limit_concurrency=max_connections`
+- `limit_max_requests=1000` (was 10000 — more frequent worker recycling)
+- `timeout_graceful_shutdown=10` (was 30)
+
+**Rationale:** Aggressive TCP connection and worker recycling mitigates event loop saturation from long-lived connections.
+
+### Phase 2: ConnectionTimeoutMiddleware
+
+Added new ASGI middleware class `ConnectionTimeoutMiddleware`:
+- Tracks connection age via `time.monotonic()`
+- Wraps `receive()` — injects `http.disconnect` when elapsed > threshold
+- Wraps `send()` — tracks `response_started` to prevent double-response errors
+- Logs WARNING when connection killed
+- Only applies to HTTP scope (WebSocket/lifespan pass through)
+- New CLI argument: `--connection-timeout` (int, default 60, env `OPM_CONNECTION_TIMEOUT`)
+- Validation: must be ≥5 seconds (hard-exit if violated)
+- Middleware order: `_FixArgumentsMiddleware` → `ConnectionTimeoutMiddleware`
+- Applied to both `--http` and `--sse` modes
+
+### Bonus: SSE Mode REST API Mounting
+
+Fixed code gap: REST API was not mounted in SSE mode.
+- Before: `--sse --rest-api` ignored REST API flag
+- After: `--sse --rest-api` correctly mounts `/api/v1` router
+- Mirrors HTTP mode pattern
+
+**Files Modified:** `src/open_project_manager_mcp/__main__.py`
+- Line 9: Added `import time`
+- Lines 83-132: Added `ConnectionTimeoutMiddleware` class
+- Lines 257-260: Added `--connection-timeout` CLI argument
+- Lines 295-311: Added `connection_timeout` parsing/validation
+- Lines 380-402: Applied middleware to both modes; added REST API mounting to SSE
+- Lines 404-413: Updated uvicorn parameters
+
+**Deployment on skitterphuger:**
+```bash
+python -m open_project_manager_mcp \
+  --http \
+  --rest-api \
+  --host 0.0.0.0 \
+  --port 8765 \
+  --connection-timeout 60
+```
+
+**Expected Behavior:**
+- Connections forcibly closed after 60 seconds
+- Worker processes recycled after 1000 requests
+- TCP keep-alive connections recycled after 5 seconds idle
+- Server remains responsive under sustained load
+
+---
+
 ## v0.2.0 Feature Architecture (Elliot)
 
 Seven features scoped for v0.2.0. Decisions below cover schema DDL, MCP tool signatures, integration points, risks, and build order. All features implemented inside the existing `create_server()` closure model unless stated otherwise.

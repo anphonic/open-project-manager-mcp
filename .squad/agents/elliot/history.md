@@ -66,4 +66,55 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 9. **`--generate-token` CLI:** Unchanged — stdout-only, no DB write
 10. **`OPM_REGISTRATION_KEY` min length:** 16 chars startup warning to stderr
 
+### 2026-04-02 — Transport stability analysis (P0 production incident)
+
+**Task:** Evaluate three options for fixing OPM server instability under load.
+
+**Problem:** FastMCP `--http` mode (streamable-HTTP) with long-lived SSE connections saturates the event loop, causing:
+- Server becomes unresponsive to HTTP requests
+- CPU spikes to 77%+
+- SSH hangs (kernel-level saturation)
+
+**Options evaluated:**
+1. **Watchdog + restart** — symptom mitigation only
+2. **Stale connection killer middleware** — targets root cause but complex
+3. **Migrate to SSE** — REJECTED (SSE is deprecated per MCP spec 2025-03-26)
+
+**Decision:** Hybrid approach in three phases:
+- **Phase 1:** uvicorn tuning (`timeout_keep_alive=5`, `limit_max_requests=1000`)
+- **Phase 2:** Custom `ConnectionTimeoutMiddleware` to cap connection age at 60s
+- **Phase 3:** Watchdog script as defense-in-depth backstop
+
+**Key findings:**
+- `timeout_keep_alive` only applies between requests, NOT during active SSE streams
+- `h11_max_incomplete_event_size` is irrelevant (HTTP parsing, not streaming)
+- Streamable-HTTP is the correct direction; SSE is deprecated
+- No client config changes required
+
+**Deliverable:** `.squad/decisions/inbox/elliot-transport-stability.md`
+
 ## Learnings
+
+### uvicorn timeout settings
+- `timeout_keep_alive` controls idle time between HTTP requests on a keep-alive connection, NOT active stream duration
+- For SSE/streaming, you need custom middleware to enforce max connection age
+- `limit_max_requests` forces worker recycling — useful for memory hygiene but doesn't help with stuck connections
+
+### MCP transport protocol evolution
+- SSE transport is deprecated (MCP spec 2025-03-26)
+- Streamable-HTTP is the standard going forward
+- Copilot CLI `"type": "http"` connects to streamable-HTTP servers
+- Both transports can suffer from unbounded connection lifetime if clients misbehave
+
+### FastMCP limitations
+- No built-in session timeouts or connection age limits
+- SSE streams stay open until client disconnects
+- Must implement defensive middleware at ASGI level
+
+### 2026-04-02 — Transport stability decision approved
+
+**Status:** APPROVED — Darlene assigned to implement Phases 1 & 2; Mobley assigned to transport analysis; Romero assigned to write 13 new middleware tests.
+
+**Architecture decision merged to `.squad/decisions.md`:** Full OPM Transport Stability entry (94 lines) with problem statement, options evaluated, chosen approach, implementation plan, success criteria, and future considerations.
+
+**Mobley findings:** REST API gap in SSE mode identified; recommended as defensive fix even if staying with HTTP mode.

@@ -87,4 +87,57 @@ The coordinator (GitHub Copilot CLI) built `server.py` and all 11 tools directly
 
 **Tests:** 26 new tests in `tests/test_registration.py` → **250 total** (all passing). Covers: 404 disabled, 401 wrong key, 400 invalid squad, 201 success + DB row, 409 duplicate, 429 rate limit, 401/404/204 deregister paths, DB token in `_check_auth`, env var precedence, unauthenticated mode, startup warning.
 
+### 2026-04-02 — Transport stability fix (Phase 1 & 2)
+
+**Task:** Implement two-phase transport stability fix per Elliot's architecture decision (`elliot-transport-stability.md`).
+
+**Context:** OPM running in `--http` mode on skitterphuger exhibits critical stability failures — server becomes unresponsive within minutes under load, CPU spikes to 77%+, SSH hangs. Root cause: FastMCP streamable-HTTP transport has no session timeouts; MCP clients hold SSE connections open indefinitely (16+ minutes observed), saturating the event loop.
+
+**Work completed in `__main__.py`:**
+
+**Phase 1: uvicorn parameter tuning**
+- `timeout_keep_alive`: 30 → 5 seconds — force TCP connection recycling after each request burst
+- `limit_max_requests`: 10000 → 1000 — more frequent worker recycling
+- `timeout_graceful_shutdown`: 30 → 10 seconds — faster graceful shutdown
+
+**Phase 2: ConnectionTimeoutMiddleware**
+- New ASGI middleware class added alongside `_FixArgumentsMiddleware`
+- Tracks connection age via `time.monotonic()`; default 60s max age
+- Wraps `receive()` — returns `{"type": "http.disconnect"}` when elapsed > threshold
+- Wraps `send()` — tracks `response_started` flag to avoid double-response errors
+- Logs `WARNING` when connection killed: `[ConnectionTimeoutMiddleware] Killed connection after {elapsed:.1f}s`
+- Only applies to HTTP scope (passes through WebSocket/lifespan unchanged)
+- Exception handler sends 408 timeout response if timeout fires before response started
+
+**New CLI argument:**
+- `--connection-timeout` (int, default 60, env `OPM_CONNECTION_TIMEOUT`)
+- Validation: must be >= 5 seconds (exits with FATAL message if lower)
+- Applied to both `--http` and `--sse` modes
+
+**Middleware stacking:**
+```python
+app = _FixArgumentsMiddleware(app)
+app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
+```
+
+**SSE mode REST API fix (Mobley gap):**
+- Added REST API mounting logic to SSE mode (previously only worked in HTTP mode)
+- Mirrors HTTP mode pattern: checks `args.rest_api and hasattr(mcp, "_rest_router")`
+- SSE mode now supports `--sse --rest-api` correctly
+
+**New import:** Added `import time` at module top.
+
+**Expected outcome:** OPM stays responsive under sustained multi-agent load for 24+ hours; no SSH lockups on skitterphuger; connection timeout warnings in logs indicate middleware working; watchdog (Phase 3, ops task) reports zero restarts.
+
+### uvicorn timeout behavior
+- `timeout_keep_alive` applies only between HTTP requests on a keep-alive connection, NOT during active SSE streams
+- For unbounded streaming (SSE), must implement connection-age enforcement at ASGI layer
+- uvicorn settings alone cannot fix this; custom middleware required
+
+### Connection timeout middleware complexity
+- Must wrap both `receive()` and `send()` to avoid race conditions
+- Track `response_started` flag to prevent double-response errors (408 + body if timeout before response)
+- Use `time.monotonic()` instead of `time.time()` to avoid clock skew
+- Only apply to HTTP scope; bypass WebSocket/lifespan
+
 ## Learnings
