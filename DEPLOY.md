@@ -170,6 +170,160 @@ sleep 2
 curl -s http://192.168.1.178:8765/api/v1/stats | head -20
 ```
 
+> **Note:** If the source repo is not cloned on skitterphuger (e.g., only the installed package is present), see "Deploying When Source Is on a Dev Machine" below instead of using `git pull`.
+
+---
+
+## Deploying When Source Is on a Dev Machine
+
+This section covers the real-world scenario where source code lives on your development machine (e.g., Windows at `J:\Coding\open-project-manager-mcp`) and the server (skitterphuger) only has the installed package/executable — no git repo clone.
+
+Choose one of the three methods below, in order of preference:
+
+### Method 1: Install Directly from Git Remote (Recommended)
+
+If the repository is hosted on GitHub/GitLab and the server has internet access:
+
+```bash
+pip install --upgrade "git+https://github.com/<owner>/open-project-manager-mcp.git@<commit-or-tag>"
+```
+
+**Steps:**
+- Replace `<owner>` with the actual GitHub username or organization
+- Use a specific commit SHA or tag (e.g., `@v0.2.0` or `@abc1234def567`) for reproducibility; avoid `@main` in production
+- Then restart OPM as normal:
+
+```bash
+# Find and kill existing process
+PID=$(pgrep -f "open_project_manager_mcp" | head -1)
+if [ -n "$PID" ]; then
+  kill "$PID"
+  sleep 2
+  if ps -p "$PID" > /dev/null; then
+    kill -9 "$PID"
+  fi
+fi
+
+# Restart
+nohup ./start.sh > /tmp/opm.log 2>&1 &
+echo $! > /tmp/opm.pid
+```
+
+**Pros:**
+- Simplest method; no manual file transfer
+- Automatically pulls latest code from the remote
+- Best for CI/CD automation
+
+**Cons:**
+- Requires internet access on skitterphuger
+- Requires GitHub/GitLab to be publicly accessible (or server has SSH keys set up)
+
+---
+
+### Method 2: Build Wheel Locally, SCP to Server
+
+When the server can't reach the git remote (private repo, no internet access, etc.):
+
+**On dev machine:**
+
+```bash
+cd J:\Coding\open-project-manager-mcp   # or wherever source lives
+
+# Install build tools
+pip install build
+
+# Build the wheel
+python -m build --wheel
+# Produces: dist/open_project_manager_mcp-<version>-py3-none-any.whl
+
+# Transfer to server (using SCP or another secure method)
+scp dist/open_project_manager_mcp-*.whl skitterphuger:/tmp/
+```
+
+**On skitterphuger:**
+
+```bash
+# Install the wheel
+pip install --upgrade /tmp/open_project_manager_mcp-*.whl
+
+# Kill and restart OPM
+PID=$(pgrep -f "open_project_manager_mcp" | head -1)
+if [ -n "$PID" ]; then
+  kill "$PID"
+  sleep 2
+  if ps -p "$PID" > /dev/null; then
+    kill -9 "$PID"
+  fi
+fi
+
+# Restart
+nohup ./start.sh > /tmp/opm.log 2>&1 &
+echo $! > /tmp/opm.pid
+
+# Verify
+curl -s http://192.168.1.178:8765/api/v1/stats | head -10
+```
+
+**Pros:**
+- Works without internet access on the server
+- Supports private repositories
+- Full control over exactly which code is deployed
+
+**Cons:**
+- Requires manual build and transfer step
+- Need to ensure `build` package is installed locally
+
+---
+
+### Method 3: SCP Source Directory and Install Editable
+
+For rapid iteration when you want live editable installs (not recommended for production):
+
+**On dev machine:**
+
+```bash
+# Sync source to server (exclude .git, __pycache__, etc.)
+rsync -av --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
+  --exclude='.pytest_cache' --exclude='*.egg-info' \
+  J:/Coding/open-project-manager-mcp/ \
+  skitterphuger:/home/skitterphuger/mcp/open-project-manager/
+```
+
+*(On Windows, use `wsl rsync` if WSL is available, or use WinSCP / robocopy as alternatives)*
+
+**On skitterphuger:**
+
+```bash
+# Navigate to synced directory
+cd /home/skitterphuger/mcp/open-project-manager
+
+# Install in editable mode
+pip install -e '.[http]'
+
+# Kill and restart OPM
+PID=$(pgrep -f "open_project_manager_mcp" | head -1)
+if [ -n "$PID" ]; then
+  kill "$PID"
+  sleep 2
+  if ps -p "$PID" > /dev/null; then
+    kill -9 "$PID"
+  fi
+fi
+
+# Restart
+nohup ./start.sh > /tmp/opm.log 2>&1 &
+echo $! > /tmp/opm.pid
+```
+
+**Pros:**
+- Code changes are immediately reflected (no rebuild)
+- Ideal for rapid testing and debugging
+
+**Cons:**
+- Not suitable for production (editable installs can break unexpectedly)
+- Requires syncing source on every deployment
+- Potential for out-of-sync state between dev and server
+
 ---
 
 ## Persistent Start Script (Full Content)

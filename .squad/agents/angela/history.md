@@ -77,4 +77,6 @@ The coordinator (GitHub Copilot CLI) wrote all packaging and documentation direc
 
 2026-04-02: Created DEPLOY.md (14KB skitterphuger runbook — start.sh, watchdog, upgrade procedure, troubleshooting, mcp-config.json). Updated README.md with all 9 new MCP tools and 14 new REST endpoints from messaging build orders 8-10. Posted deployment guide to squad knowledge.
 
+2026-04-02: Added remote-source deployment section to DEPLOY.md (wheel build, git remote install, rsync methods).
+
 ## Learnings
