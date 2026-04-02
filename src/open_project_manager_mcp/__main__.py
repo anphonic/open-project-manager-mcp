@@ -246,6 +246,7 @@ async def session_reaper(
     session_manager,
     tracker: SessionActivityTracker,
     check_interval: int = 30,
+    write_lock_fn=None,
 ):
     """Background task that terminates stale sessions."""
     logger = logging.getLogger("opm.session_reaper")
@@ -269,6 +270,13 @@ async def session_reaper(
                 except Exception as e:
                     logger.warning(f"[SessionReaper] Failed to terminate {session_id}: {e}")
             
+            # Force-release write lock if the reaped session was holding it
+            if write_lock_fn is not None:
+                lock = write_lock_fn()
+                if lock.locked():
+                    lock.release()
+                    logger.warning(f"[SessionReaper] Force-released write lock for session {session_id}")
+
             # Remove from tracker regardless
             tracker.remove(session_id)
             
