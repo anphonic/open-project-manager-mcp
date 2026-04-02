@@ -1,14 +1,8 @@
 {
   "mcpServers": {
     "squad-knowledge": {
-      "type": "stdio",
-      "command": "ssh",
-      "tools": ["*"],
-      "args": [
-        "-i", "C:\\Users\\qbrot\\.ssh\\id_ed25519_skitterphuger",
-        "skitterphuger@192.168.1.178",
-        "/home/skitterphuger/mcp/env/bin/squad-knowledge-mcp --db-path /home/skitterphuger/mcp/squad-knowledge/chroma_db_new --offline"
-      ]
+      "type": "sse",
+      "url": "http://192.168.1.178:8768"
     },
     "open-project-manager": {
       "type": "http",
