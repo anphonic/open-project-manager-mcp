@@ -22,12 +22,17 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.authentication import AuthenticationError
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, Router
 
 VALID_PRIORITIES = {"critical", "high", "medium", "low"}
 VALID_STATUSES = {"pending", "in_progress", "done", "blocked"}
 VALID_WEBHOOK_EVENTS = {"task.created", "task.updated", "task.completed", "task.deleted"}
+VALID_TEAM_STATUSES = {"online", "offline", "busy", "degraded"}
+VALID_NOTIFICATION_TYPES = {"squad.status", "squad.alert", "squad.heartbeat"}
+VALID_SUBSCRIPTION_EVENTS = {"server.stats", "server.health", "project.summary"}
+_SUB_MIN_INTERVAL = 60       # seconds
+_SUB_MAX_INTERVAL = 86400    # seconds
 
 _VALID_UPDATE_COLUMNS = frozenset(
     {"title", "description", "priority", "project", "status", "assignee", "tags", "due_date", "updated_at"}
@@ -132,6 +137,36 @@ CREATE TABLE IF NOT EXISTS tenant_keys (
     key        TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS team_status (
+    squad      TEXT    PRIMARY KEY,
+    status     TEXT    NOT NULL,
+    message    TEXT,
+    updated_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS team_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    squad      TEXT    NOT NULL,
+    event_type TEXT    NOT NULL,
+    data       TEXT,
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS team_events_squad_idx   ON team_events(squad);
+CREATE INDEX IF NOT EXISTS team_events_created_idx ON team_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+    id             TEXT    PRIMARY KEY,
+    subscriber     TEXT    NOT NULL,
+    url            TEXT    NOT NULL,
+    event_type     TEXT    NOT NULL,
+    project        TEXT,
+    interval_sec   INTEGER,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    last_fired_at  TEXT,
+    created_at     TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_sub_type_idx ON event_subscriptions(event_type);
 """
 
 _FTS_SCHEMA = """
@@ -194,6 +229,10 @@ def create_server(
         _fts_available = False
 
     _lock = asyncio.Lock()
+    _start_time: float = time.time()
+    _event_bus_clients: list[asyncio.Queue] = []
+    _bg_health_task: Optional[asyncio.Task] = None
+    _bg_sub_task: Optional[asyncio.Task] = None
 
     def _verify_bearer(token: str) -> str | None:
         """Return tenant_id if token is valid, else None. Env var keys take precedence."""
@@ -264,6 +303,168 @@ def create_server(
             return getattr(getattr(ctx, "auth", None), "client_id", None) or "system"
         except Exception:
             return "system"
+
+    # ------------------------------------------------------------------
+    # SSE event bus helpers
+    # ------------------------------------------------------------------
+
+    def _publish_event(event_type: str, data: dict) -> None:
+        """Fanout an event to all connected SSE clients. Silently drops if a client queue is full."""
+        payload = {"event": event_type, "data": data, "timestamp": _now()}
+        for q in list(_event_bus_clients):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    def _publish_queue_stats() -> None:
+        """Publish a queue.stats event. No-op if no clients are connected."""
+        if not _event_bus_clients:
+            return
+        try:
+            by_status = {
+                r["status"]: r["cnt"]
+                for r in conn.execute(
+                    "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
+                ).fetchall()
+            }
+        except Exception:
+            return
+        _publish_event("queue.stats", {
+            "pending_count": by_status.get("pending", 0),
+            "in_progress_count": by_status.get("in_progress", 0),
+            "blocked_count": by_status.get("blocked", 0),
+            "completed_count": by_status.get("done", 0),
+        })
+
+    def _publish_health_event(status: str, message: Optional[str] = None) -> None:
+        """Publish a server.health event to all connected SSE clients."""
+        data: dict = {
+            "status": status,
+            "uptime_seconds": int(time.time() - _start_time),
+            "active_connections": len(_event_bus_clients),
+        }
+        if message:
+            data["message"] = message
+        _publish_event("server.health", data)
+
+    async def _health_loop() -> None:
+        """Emit server.health every 30 seconds while clients are connected."""
+        while True:
+            await asyncio.sleep(30)
+            if _event_bus_clients:
+                _publish_health_event("healthy")
+
+    def _ensure_bg_health_task() -> None:
+        """Start the health background task if not already running. Idempotent."""
+        nonlocal _bg_health_task
+        if _bg_health_task is not None and not _bg_health_task.done():
+            return
+        _bg_health_task = asyncio.create_task(_health_loop())
+
+    async def _subscriptions_loop() -> None:
+        """Check every 30s for due interval subscriptions and fire them."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                rows = conn.execute(
+                    "SELECT id, subscriber, url, event_type, project, interval_sec"
+                    " FROM event_subscriptions"
+                    " WHERE enabled = 1 AND interval_sec IS NOT NULL"
+                    " AND (last_fired_at IS NULL"
+                    "      OR datetime(last_fired_at, '+' || interval_sec || ' seconds')"
+                    "         <= datetime('now'))"
+                ).fetchall()
+            except Exception:
+                continue
+            for row in rows:
+                event_type = row["event_type"]
+                try:
+                    if event_type == "server.stats":
+                        by_status = {
+                            r["status"]: r["cnt"]
+                            for r in conn.execute(
+                                "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
+                            ).fetchall()
+                        }
+                        payload = {
+                            "queue_depth": sum(v for k, v in by_status.items() if k != "done"),
+                            "by_status": by_status,
+                            "uptime_sec": int(time.time() - _start_time),
+                        }
+                    elif event_type == "project.summary":
+                        project = row["project"] or ""
+                        by_status = {
+                            r["status"]: r["cnt"]
+                            for r in conn.execute(
+                                "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
+                                (project,),
+                            ).fetchall()
+                        }
+                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        overdue_row = conn.execute(
+                            "SELECT COUNT(*) as cnt FROM tasks"
+                            " WHERE project = ? AND due_date IS NOT NULL AND due_date < ? AND status != 'done'",
+                            (project, today),
+                        ).fetchone()
+                        payload = {
+                            "project": project,
+                            "total": sum(by_status.values()),
+                            "pending": by_status.get("pending", 0),
+                            "in_progress": by_status.get("in_progress", 0),
+                            "done": by_status.get("done", 0),
+                            "blocked": by_status.get("blocked", 0),
+                            "overdue": overdue_row["cnt"] if overdue_row else 0,
+                        }
+                    elif event_type == "server.health":
+                        payload = {
+                            "status": "healthy",
+                            "uptime_seconds": int(time.time() - _start_time),
+                            "active_connections": len(_event_bus_clients),
+                        }
+                    else:
+                        continue
+                    asyncio.create_task(_fire_event_subscriptions(event_type, payload))
+                except Exception:
+                    pass
+
+    def _ensure_bg_sub_task() -> None:
+        """Start the subscription background task if not already running. Idempotent."""
+        nonlocal _bg_sub_task
+        if _bg_sub_task is not None and not _bg_sub_task.done():
+            return
+        _bg_sub_task = asyncio.create_task(_subscriptions_loop())
+
+    def _project_summary(project: str) -> str:
+        """Shared logic for project summary — used by MCP tool and REST endpoint."""
+        if not project or len(project) > _MAX_SHORT_FIELD:
+            return f"Error: 'project' is required and must be under {_MAX_SHORT_FIELD} characters"
+        try:
+            by_status = {
+                r["status"]: r["cnt"]
+                for r in conn.execute(
+                    "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
+                    (project,),
+                ).fetchall()
+            }
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            overdue_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM tasks"
+                " WHERE project = ? AND due_date IS NOT NULL AND due_date < ? AND status != 'done'",
+                (project, today),
+            ).fetchone()
+        except sqlite3.Error:
+            return "Error: database error reading project summary"
+        total = sum(by_status.values())
+        return json.dumps({
+            "project": project,
+            "total": total,
+            "pending": by_status.get("pending", 0),
+            "in_progress": by_status.get("in_progress", 0),
+            "done": by_status.get("done", 0),
+            "blocked": by_status.get("blocked", 0),
+            "overdue": overdue_row["cnt"] if overdue_row else 0,
+        })
 
     def _parse_due_date(due_date: str) -> Optional[str]:
         """Return error string if invalid, None if valid ISO 8601."""
@@ -420,6 +621,48 @@ def create_server(
             except Exception:
                 pass  # fire-and-forget; no retries in v0.2.0
 
+    async def _fire_event_subscriptions(event_type: str, payload: dict) -> None:
+        """Deliver an event to all enabled subscriptions of the given type. Fire-and-forget."""
+        try:
+            import httpx
+        except ImportError:
+            return
+        try:
+            rows = conn.execute(
+                "SELECT id, url FROM event_subscriptions WHERE enabled = 1 AND event_type = ?",
+                (event_type,),
+            ).fetchall()
+        except Exception:
+            return
+        if not rows:
+            return
+        envelope = {
+            "event": event_type,
+            "timestamp": _now(),
+            "data": payload,
+        }
+        payload_bytes = json.dumps(envelope).encode()
+        headers = {"Content-Type": "application/json"}
+        fired_ids: list[str] = []
+        for row in rows:
+            try:
+                async with httpx.AsyncClient(timeout=5.0, verify=True) as client:
+                    await client.post(row["url"], content=payload_bytes, headers=headers)
+                fired_ids.append(row["id"])
+            except Exception:
+                pass
+        if fired_ids:
+            now = _now()
+            try:
+                for sub_id in fired_ids:
+                    conn.execute(
+                        "UPDATE event_subscriptions SET last_fired_at = ? WHERE id = ?",
+                        (now, sub_id),
+                    )
+                conn.commit()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Task CRUD
     # ------------------------------------------------------------------
@@ -467,6 +710,11 @@ def create_server(
                 {"id": id, "title": title, "priority": priority, "status": "pending", "project": project},
             )
         )
+        _publish_event("task.created", {
+            "id": id, "title": title, "priority": priority,
+            "status": "pending", "project": project,
+        })
+        _publish_queue_stats()
         return json.dumps({"id": id, "status": "pending", "priority": priority, "project": project})
 
     @mcp.tool()
@@ -534,6 +782,10 @@ def create_server(
         asyncio.create_task(
             _fire_webhooks("task.updated", task_id, task_project, {"id": task_id, "updated": list(updates.keys())})
         )
+        _publish_event("task.updated", {
+            "id": task_id, "updated": list(updates.keys()), "project": task_project,
+        })
+        _publish_queue_stats()
         return json.dumps({"id": task_id, "updated": list(updates.keys())})
 
     @mcp.tool()
@@ -556,6 +808,8 @@ def create_server(
         asyncio.create_task(
             _fire_webhooks("task.completed", task_id, task_project, {"id": task_id, "status": "done"})
         )
+        _publish_event("task.completed", {"id": task_id, "status": "done", "project": task_project})
+        _publish_queue_stats()
         return json.dumps({"id": task_id, "status": "done"})
 
     @mcp.tool()
@@ -581,6 +835,8 @@ def create_server(
         asyncio.create_task(
             _fire_webhooks("task.deleted", task_id, task_project, {"id": task_id})
         )
+        _publish_event("task.deleted", {"id": task_id, "project": task_project})
+        _publish_queue_stats()
         return json.dumps({"id": task_id, "deleted": True})
 
     # ------------------------------------------------------------------
@@ -785,6 +1041,217 @@ def create_server(
             "by_priority": by_priority,
             "oldest_open": oldest["oldest"] if oldest else None,
         })
+
+    @mcp.tool()
+    def get_server_stats() -> str:
+        """Get server statistics: task counts, uptime, and active SSE connections."""
+        try:
+            by_status = {
+                r["status"]: r["cnt"]
+                for r in conn.execute(
+                    "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
+                ).fetchall()
+            }
+            by_project: dict[str, dict] = {}
+            for r in conn.execute(
+                "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status"
+            ).fetchall():
+                by_project.setdefault(r["project"], {})[r["status"]] = r["cnt"]
+        except sqlite3.Error:
+            return "Error: database error reading server stats"
+        queue_depth = sum(v for k, v in by_status.items() if k != "done")
+        return json.dumps({
+            "queue_depth": queue_depth,
+            "by_status": by_status,
+            "by_project": by_project,
+            "uptime_sec": int(time.time() - _start_time),
+            "active_sse_clients": len(_event_bus_clients),
+        })
+
+    @mcp.tool()
+    def get_project_summary(project: str) -> str:
+        """Get a task summary for a specific project, including overdue count."""
+        return _project_summary(project)
+
+    # ------------------------------------------------------------------
+    # Feature 8: Team status & events
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def set_team_status(squad: str, status: str, message: Optional[str] = None) -> str:
+        """Set the online/offline/busy/degraded status for a squad."""
+        if not squad or len(squad) > _MAX_SHORT_FIELD:
+            return f"Error: 'squad' is required and must be under {_MAX_SHORT_FIELD} characters"
+        if status not in VALID_TEAM_STATUSES:
+            return f"Error: invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_TEAM_STATUSES))}"
+        if message and len(message) > _MAX_SHORT_FIELD:
+            return f"Error: 'message' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
+        now = _now()
+        async with _lock:
+            try:
+                conn.execute(
+                    "INSERT INTO team_status (squad, status, message, updated_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(squad) DO UPDATE SET status=excluded.status,"
+                    " message=excluded.message, updated_at=excluded.updated_at",
+                    (squad, status, message, now),
+                )
+                conn.commit()
+            except sqlite3.Error:
+                return "Error: database error setting team status"
+        _publish_event("squad.status", {"squad": squad, "status": status, "message": message})
+        return json.dumps({"squad": squad, "status": status, "message": message, "updated_at": now})
+
+    @mcp.tool()
+    def get_team_status(squad: Optional[str] = None) -> str:
+        """Get current status for all squads or a specific squad."""
+        try:
+            if squad:
+                row = conn.execute(
+                    "SELECT squad, status, message, updated_at FROM team_status WHERE squad = ?",
+                    (squad,),
+                ).fetchone()
+                if row is None:
+                    return f"Error: squad '{squad}' not found"
+                return json.dumps(dict(row))
+            rows = conn.execute(
+                "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad"
+            ).fetchall()
+        except sqlite3.Error:
+            return "Error: database error reading team status"
+        return json.dumps({"squads": [dict(r) for r in rows]})
+
+    @mcp.tool()
+    async def post_team_event(squad: str, event_type: str, data: Optional[str] = None) -> str:
+        """Post a notification event for a squad (alert, heartbeat, etc.)."""
+        if not squad or len(squad) > _MAX_SHORT_FIELD:
+            return f"Error: 'squad' is required and must be under {_MAX_SHORT_FIELD} characters"
+        if event_type not in VALID_NOTIFICATION_TYPES:
+            return f"Error: invalid event_type '{event_type}'. Must be one of: {', '.join(sorted(VALID_NOTIFICATION_TYPES))}"
+        if data and len(data) > _MAX_DESCRIPTION:
+            return f"Error: 'data' exceeds maximum length of {_MAX_DESCRIPTION} characters"
+        now = _now()
+        async with _lock:
+            try:
+                conn.execute(
+                    "INSERT INTO team_events (squad, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+                    (squad, event_type, data, now),
+                )
+                conn.commit()
+            except sqlite3.Error:
+                return "Error: database error posting team event"
+        _publish_event(event_type, {"squad": squad, "data": data})
+        return json.dumps({"squad": squad, "event_type": event_type, "created_at": now})
+
+    @mcp.tool()
+    def get_team_events(
+        squad: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> str:
+        """Get recent team events, optionally filtered by squad or event_type."""
+        limit = max(1, min(limit, 200))
+        conditions: list[str] = []
+        params: list[object] = []
+        if squad:
+            conditions.append("squad = ?")
+            params.append(squad)
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        try:
+            rows = conn.execute(
+                f"SELECT id, squad, event_type, data, created_at FROM team_events"
+                f" {where} ORDER BY created_at DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+        except sqlite3.Error:
+            return "Error: database error reading team events"
+        return json.dumps({"events": [dict(r) for r in rows], "count": len(rows)})
+
+    # ------------------------------------------------------------------
+    # Feature 9: Event subscriptions
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def subscribe_events(
+        id: str,
+        subscriber: str,
+        url: str,
+        event_type: str,
+        project: Optional[str] = None,
+        interval_sec: Optional[int] = None,
+    ) -> str:
+        """Subscribe to periodic server/project events delivered to a HTTPS URL."""
+        if len(id) > _MAX_SHORT_FIELD:
+            return f"Error: 'id' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
+        if len(subscriber) > _MAX_SHORT_FIELD:
+            return f"Error: 'subscriber' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
+        ssrf_err = await _check_ssrf(url)
+        if ssrf_err:
+            return ssrf_err
+        if event_type not in VALID_SUBSCRIPTION_EVENTS:
+            return f"Error: invalid event_type '{event_type}'. Must be one of: {', '.join(sorted(VALID_SUBSCRIPTION_EVENTS))}"
+        if interval_sec is not None:
+            if interval_sec < _SUB_MIN_INTERVAL or interval_sec > _SUB_MAX_INTERVAL:
+                return f"Error: interval_sec must be between {_SUB_MIN_INTERVAL} and {_SUB_MAX_INTERVAL}"
+        async with _lock:
+            try:
+                conn.execute(
+                    "INSERT INTO event_subscriptions"
+                    " (id, subscriber, url, event_type, project, interval_sec, enabled, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                    (id, subscriber, url, event_type, project, interval_sec, _now()),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                return f"Error: subscription '{id}' already exists"
+            except sqlite3.Error:
+                return "Error: database error creating subscription"
+        _ensure_bg_sub_task()
+        return json.dumps({
+            "id": id, "subscriber": subscriber, "event_type": event_type,
+            "project": project, "interval_sec": interval_sec,
+        })
+
+    @mcp.tool()
+    def list_subscriptions(
+        subscriber: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> str:
+        """List event subscriptions, optionally filtered by subscriber or event_type."""
+        conditions: list[str] = []
+        params: list[object] = []
+        if subscriber:
+            conditions.append("subscriber = ?")
+            params.append(subscriber)
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        try:
+            rows = conn.execute(
+                f"SELECT id, subscriber, url, event_type, project, interval_sec,"
+                f" enabled, last_fired_at, created_at"
+                f" FROM event_subscriptions {where} ORDER BY created_at",
+                params,
+            ).fetchall()
+        except sqlite3.Error:
+            return "Error: database error listing subscriptions"
+        return json.dumps({"subscriptions": [dict(r) for r in rows]})
+
+    @mcp.tool()
+    async def unsubscribe_events(id: str, human_approval: bool = False) -> str:
+        """Delete an event subscription. Requires human_approval=True."""
+        if not human_approval:
+            return "Error: human_approval=True is required to delete a subscription"
+        async with _lock:
+            cur = conn.execute("DELETE FROM event_subscriptions WHERE id = ?", (id,))
+            conn.commit()
+            if cur.rowcount == 0:
+                return f"Error: subscription '{id}' not found"
+        return json.dumps({"id": id, "deleted": True})
 
     # ------------------------------------------------------------------
     # Feature 1: Due dates
@@ -1486,8 +1953,15 @@ def create_server(
                             return JSONResponse({"error": f"Error: task '{tid}' already exists"}, status_code=409)
                         except sqlite3.Error:
                             return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    t_project = body.get("project", "default")
+                    t_priority = body.get("priority", "medium")
+                    _publish_event("task.created", {
+                        "id": tid, "title": body.get("title"), "priority": t_priority,
+                        "status": "pending", "project": t_project,
+                    })
+                    _publish_queue_stats()
                     return JSONResponse(
-                        {"id": tid, "status": "pending", "priority": body.get("priority", "medium"), "project": body.get("project", "default")},
+                        {"id": tid, "status": "pending", "priority": t_priority, "project": t_project},
                         status_code=201,
                     )
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
@@ -1560,21 +2034,30 @@ def create_server(
                             conn.commit()
                         except sqlite3.Error:
                             return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    task_project_patch = upd.get("project") or old_data.get("project", "default")
+                    _publish_event("task.updated", {
+                        "id": task_id, "updated": list(upd.keys()), "project": task_project_patch,
+                    })
+                    _publish_queue_stats()
                     return JSONResponse({"id": task_id, "updated": list(upd.keys())})
                 elif request.method == "DELETE":
                     confirm = request.query_params.get("confirm", "").lower() == "true"
                     if not confirm:
                         return JSONResponse({"error": "Error: confirm=true is required to delete a task"}, status_code=400)
+                    task_project_del = "default"
                     async with _lock:
-                        row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                        row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
                         if row is None:
                             return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
+                        task_project_del = row["project"]
                         conn.execute(
                             "DELETE FROM task_deps WHERE task_id = ? OR depends_on = ?", (task_id, task_id)
                         )
                         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
                         _log(task_id, "deleted", actor=actor)
                         conn.commit()
+                    _publish_event("task.deleted", {"id": task_id, "project": task_project_del})
+                    _publish_queue_stats()
                     return JSONResponse({"id": task_id, "deleted": True})
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
@@ -1601,6 +2084,7 @@ def create_server(
                 actor, err = await _check_auth(request)
                 if err:
                     return err
+                detailed = request.query_params.get("detailed", "").lower() == "true"
                 try:
                     by_status = {
                         r["status"]: r["cnt"]
@@ -1619,11 +2103,24 @@ def create_server(
                     ).fetchone()
                 except sqlite3.Error:
                     return JSONResponse({"error": "Error: database error"}, status_code=500)
-                return JSONResponse({
+                result: dict = {
                     "by_status": by_status,
                     "by_priority": by_priority,
                     "oldest_open": oldest["oldest"] if oldest else None,
-                })
+                }
+                if detailed:
+                    result["uptime_sec"] = int(time.time() - _start_time)
+                    result["active_sse_clients"] = len(_event_bus_clients)
+                    try:
+                        by_project: dict[str, dict] = {}
+                        for r in conn.execute(
+                            "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status"
+                        ).fetchall():
+                            by_project.setdefault(r["project"], {})[r["status"]] = r["cnt"]
+                        result["by_project"] = by_project
+                    except sqlite3.Error:
+                        pass
+                return JSONResponse(result)
 
             # ------------------------------------------------------------------
             # Registration rate limiter (in-memory, resets on restart)
@@ -1740,11 +2237,290 @@ def create_server(
 
                 return Response(status_code=204)
 
+            async def events_endpoint(request: Request) -> Response:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                q: asyncio.Queue = asyncio.Queue(maxsize=100)
+                _event_bus_clients.append(q)
+                _ensure_bg_health_task()
+                _ensure_bg_sub_task()
+
+                async def event_stream():
+                    try:
+                        while True:
+                            try:
+                                payload = await asyncio.wait_for(q.get(), timeout=30.0)
+                                data = json.dumps(payload)
+                                yield f"data: {data}\n\n".encode()
+                            except asyncio.TimeoutError:
+                                yield b": keepalive\n\n"
+                    finally:
+                        try:
+                            _event_bus_clients.remove(q)
+                        except ValueError:
+                            pass
+
+                return StreamingResponse(
+                    event_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+
+            async def project_summary_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                project = request.path_params["project"]
+                return _tool_resp(_project_summary(project))
+
+            async def notifications_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                if request.method == "POST":
+                    body, body_err = await _read_json_body(request)
+                    if body_err:
+                        return body_err
+                    squad = body.get("squad", "") if isinstance(body, dict) else ""
+                    event_type = body.get("event_type", "") if isinstance(body, dict) else ""
+                    data = body.get("data") if isinstance(body, dict) else None
+                    if not squad or len(squad) > _MAX_SHORT_FIELD:
+                        return JSONResponse({"error": "Error: 'squad' is required"}, status_code=400)
+                    if event_type not in VALID_NOTIFICATION_TYPES:
+                        return JSONResponse(
+                            {"error": f"Error: invalid event_type. Must be one of: {', '.join(sorted(VALID_NOTIFICATION_TYPES))}"},
+                            status_code=400,
+                        )
+                    now = _now()
+                    async with _lock:
+                        try:
+                            conn.execute(
+                                "INSERT INTO team_events (squad, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+                                (squad, event_type, json.dumps(data) if data is not None else None, now),
+                            )
+                            conn.commit()
+                        except sqlite3.Error:
+                            return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    _publish_event(event_type, {"squad": squad, "data": data})
+                    return JSONResponse({"squad": squad, "event_type": event_type, "created_at": now}, status_code=201)
+                return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+            async def status_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                try:
+                    rows = conn.execute(
+                        "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad"
+                    ).fetchall()
+                except sqlite3.Error:
+                    return JSONResponse({"error": "Error: database error"}, status_code=500)
+                return JSONResponse({"squads": [dict(r) for r in rows]})
+
+            async def status_squad_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                squad = request.path_params["squad"]
+                if request.method == "GET":
+                    try:
+                        row = conn.execute(
+                            "SELECT squad, status, message, updated_at FROM team_status WHERE squad = ?",
+                            (squad,),
+                        ).fetchone()
+                    except sqlite3.Error:
+                        return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    if row is None:
+                        return JSONResponse({"error": f"Error: squad '{squad}' not found"}, status_code=404)
+                    return JSONResponse(dict(row))
+                elif request.method == "PUT":
+                    body, body_err = await _read_json_body(request)
+                    if body_err:
+                        return body_err
+                    status = body.get("status", "") if isinstance(body, dict) else ""
+                    message = body.get("message") if isinstance(body, dict) else None
+                    if status not in VALID_TEAM_STATUSES:
+                        return JSONResponse(
+                            {"error": f"Error: invalid status. Must be one of: {', '.join(sorted(VALID_TEAM_STATUSES))}"},
+                            status_code=400,
+                        )
+                    now = _now()
+                    async with _lock:
+                        try:
+                            conn.execute(
+                                "INSERT INTO team_status (squad, status, message, updated_at)"
+                                " VALUES (?, ?, ?, ?)"
+                                " ON CONFLICT(squad) DO UPDATE SET status=excluded.status,"
+                                " message=excluded.message, updated_at=excluded.updated_at",
+                                (squad, status, message, now),
+                            )
+                            conn.commit()
+                        except sqlite3.Error:
+                            return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    _publish_event("squad.status", {"squad": squad, "status": status, "message": message})
+                    return JSONResponse({"squad": squad, "status": status, "message": message, "updated_at": now})
+                return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+            async def team_events_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                p = request.query_params
+                squad = p.get("squad")
+                event_type = p.get("event_type")
+                try:
+                    limit = int(p.get("limit", 50))
+                except ValueError:
+                    return JSONResponse({"error": "Error: invalid limit"}, status_code=400)
+                limit = max(1, min(limit, 200))
+                conditions: list[str] = []
+                params: list[object] = []
+                if squad:
+                    conditions.append("squad = ?")
+                    params.append(squad)
+                if event_type:
+                    conditions.append("event_type = ?")
+                    params.append(event_type)
+                where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                try:
+                    rows = conn.execute(
+                        f"SELECT id, squad, event_type, data, created_at FROM team_events"
+                        f" {where} ORDER BY created_at DESC LIMIT ?",
+                        params + [limit],
+                    ).fetchall()
+                except sqlite3.Error:
+                    return JSONResponse({"error": "Error: database error"}, status_code=500)
+                return JSONResponse({"events": [dict(r) for r in rows], "count": len(rows)})
+
+            async def subscriptions_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                if request.method == "GET":
+                    p = request.query_params
+                    subscriber = p.get("subscriber")
+                    event_type = p.get("event_type")
+                    conditions: list[str] = []
+                    params: list[object] = []
+                    if subscriber:
+                        conditions.append("subscriber = ?")
+                        params.append(subscriber)
+                    if event_type:
+                        conditions.append("event_type = ?")
+                        params.append(event_type)
+                    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                    try:
+                        rows = conn.execute(
+                            f"SELECT id, subscriber, url, event_type, project, interval_sec,"
+                            f" enabled, last_fired_at, created_at"
+                            f" FROM event_subscriptions {where} ORDER BY created_at",
+                            params,
+                        ).fetchall()
+                    except sqlite3.Error:
+                        return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    return JSONResponse({"subscriptions": [dict(r) for r in rows]})
+                elif request.method == "POST":
+                    body, body_err = await _read_json_body(request)
+                    if body_err:
+                        return body_err
+                    if not isinstance(body, dict):
+                        return JSONResponse({"error": "Error: invalid JSON body"}, status_code=400)
+                    sub_id = body.get("id", "")
+                    subscriber = body.get("subscriber", "")
+                    url = body.get("url", "")
+                    event_type = body.get("event_type", "")
+                    project = body.get("project")
+                    interval_sec = body.get("interval_sec")
+                    if not sub_id or len(sub_id) > _MAX_SHORT_FIELD:
+                        return JSONResponse({"error": "Error: 'id' is required"}, status_code=400)
+                    if not subscriber or len(subscriber) > _MAX_SHORT_FIELD:
+                        return JSONResponse({"error": "Error: 'subscriber' is required"}, status_code=400)
+                    ssrf_err = await _check_ssrf(url)
+                    if ssrf_err:
+                        return JSONResponse({"error": ssrf_err}, status_code=400)
+                    if event_type not in VALID_SUBSCRIPTION_EVENTS:
+                        return JSONResponse(
+                            {"error": f"Error: invalid event_type. Must be one of: {', '.join(sorted(VALID_SUBSCRIPTION_EVENTS))}"},
+                            status_code=400,
+                        )
+                    if interval_sec is not None:
+                        try:
+                            interval_sec = int(interval_sec)
+                        except (TypeError, ValueError):
+                            return JSONResponse({"error": "Error: interval_sec must be an integer"}, status_code=400)
+                        if interval_sec < _SUB_MIN_INTERVAL or interval_sec > _SUB_MAX_INTERVAL:
+                            return JSONResponse(
+                                {"error": f"Error: interval_sec must be between {_SUB_MIN_INTERVAL} and {_SUB_MAX_INTERVAL}"},
+                                status_code=400,
+                            )
+                    async with _lock:
+                        try:
+                            conn.execute(
+                                "INSERT INTO event_subscriptions"
+                                " (id, subscriber, url, event_type, project, interval_sec, enabled, created_at)"
+                                " VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                                (sub_id, subscriber, url, event_type, project, interval_sec, _now()),
+                            )
+                            conn.commit()
+                        except sqlite3.IntegrityError:
+                            return JSONResponse({"error": f"Error: subscription '{sub_id}' already exists"}, status_code=409)
+                        except sqlite3.Error:
+                            return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    _ensure_bg_sub_task()
+                    return JSONResponse(
+                        {"id": sub_id, "subscriber": subscriber, "event_type": event_type,
+                         "project": project, "interval_sec": interval_sec},
+                        status_code=201,
+                    )
+                return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+            async def subscription_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                sub_id = request.path_params["id"]
+                if request.method == "GET":
+                    try:
+                        row = conn.execute(
+                            "SELECT id, subscriber, url, event_type, project, interval_sec,"
+                            " enabled, last_fired_at, created_at"
+                            " FROM event_subscriptions WHERE id = ?",
+                            (sub_id,),
+                        ).fetchone()
+                    except sqlite3.Error:
+                        return JSONResponse({"error": "Error: database error"}, status_code=500)
+                    if row is None:
+                        return JSONResponse({"error": f"Error: subscription '{sub_id}' not found"}, status_code=404)
+                    return JSONResponse(dict(row))
+                elif request.method == "DELETE":
+                    confirm = request.query_params.get("confirm", "").lower() == "true"
+                    if not confirm:
+                        return JSONResponse({"error": "Error: confirm=true is required"}, status_code=400)
+                    async with _lock:
+                        cur = conn.execute("DELETE FROM event_subscriptions WHERE id = ?", (sub_id,))
+                        conn.commit()
+                        if cur.rowcount == 0:
+                            return JSONResponse({"error": f"Error: subscription '{sub_id}' not found"}, status_code=404)
+                    return JSONResponse({"id": sub_id, "deleted": True})
+                return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
             return Router(routes=[
                 Route("/tasks", endpoint=tasks_endpoint, methods=["GET", "POST"]),
                 Route("/tasks/{id:str}", endpoint=task_endpoint, methods=["GET", "PATCH", "DELETE"]),
                 Route("/projects", endpoint=projects_endpoint, methods=["GET"]),
+                Route("/projects/{project:str}/summary", endpoint=project_summary_endpoint, methods=["GET"]),
                 Route("/stats", endpoint=stats_endpoint, methods=["GET"]),
+                Route("/events", endpoint=events_endpoint, methods=["GET"]),
+                Route("/notifications", endpoint=notifications_endpoint, methods=["POST"]),
+                Route("/status", endpoint=status_endpoint, methods=["GET"]),
+                Route("/status/{squad:str}", endpoint=status_squad_endpoint, methods=["GET", "PUT"]),
+                Route("/team/events", endpoint=team_events_endpoint, methods=["GET"]),
+                Route("/subscriptions", endpoint=subscriptions_endpoint, methods=["GET", "POST"]),
+                Route("/subscriptions/{id:str}", endpoint=subscription_endpoint, methods=["GET", "DELETE"]),
                 Route("/register", endpoint=register_endpoint, methods=["POST"]),
                 Route("/register/{squad:str}", endpoint=deregister_endpoint, methods=["DELETE"]),
             ])
