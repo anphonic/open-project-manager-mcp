@@ -141,3 +141,39 @@ app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
 - Only apply to HTTP scope; bypass WebSocket/lifespan
 
 ## Learnings
+
+### 2026-04-02 — Proactive messaging (Build Orders 8, 9, 10)
+
+**Date:** 2026-04-02  
+**Task:** Implement proactive messaging system (Build Orders 8, 9, 10)
+
+**What was implemented:**
+
+1. **`StreamingResponse` import** — added to `starlette.responses` import line
+
+2. **Module-level constants** — `VALID_TEAM_STATUSES`, `VALID_NOTIFICATION_TYPES`, `VALID_SUBSCRIPTION_EVENTS`, `_SUB_MIN_INTERVAL` (60s), `_SUB_MAX_INTERVAL` (86400s)
+
+3. **Schema additions** — `team_status`, `team_events` (with squad/created_at indexes), `event_subscriptions` (with event_type index)
+
+4. **Closure variables** — `_start_time`, `_event_bus_clients`, `_bg_health_task`, `_bg_sub_task`
+
+5. **SSE event bus helpers** — `_publish_event`, `_publish_queue_stats`, `_publish_health_event`
+
+6. **Background tasks** — `_health_loop` (30s health heartbeats), `_ensure_bg_health_task`, `_subscriptions_loop` (30s interval subscription firing for server.stats/project.summary/server.health), `_ensure_bg_sub_task`
+
+7. **`_project_summary` shared helper** — used by both MCP tool and REST endpoint
+
+8. **`_fire_event_subscriptions`** — HTTP delivery to enabled subscriptions with `last_fired_at` tracking
+
+9. **Task CRUD publish hooks** — `_publish_event` + `_publish_queue_stats` added after `_fire_webhooks` in create/update/complete/delete task (MCP and REST)
+
+10. **New MCP tools** — `get_server_stats`, `get_project_summary`, `set_team_status`, `get_team_status`, `post_team_event`, `get_team_events`, `subscribe_events`, `list_subscriptions`, `unsubscribe_events`
+
+11. **Extended `stats_endpoint`** — `?detailed=true` returns uptime, SSE client count, by_project breakdown
+
+12. **New REST endpoints** — `/events` (SSE), `/projects/{project}/summary`, `/notifications` (POST), `/status` (GET), `/status/{squad}` (GET/PUT), `/team/events` (GET), `/subscriptions` (GET/POST), `/subscriptions/{id}` (GET/DELETE)
+
+**Deviations from Elliot's brief:**  
+None — all changes implemented as specified. The `_bg_health_task`/`_bg_sub_task` use `nonlocal` correctly in their `_ensure_*` wrappers. `_project_summary` placed in shared helpers section alongside `_now()`, `_log()`. REST `subscriptions_endpoint` POST inlines validation (no `__wrapped__`).
+
+**Test result:** 318 total tests passing (264 → 318 after Romero's 54 new messaging tests).

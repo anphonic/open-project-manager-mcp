@@ -116,3 +116,89 @@ Since Darlene's implementation wasn't complete yet, I wrote tests against the **
 **All 264 tests passing** (including 13 new middleware tests).
 
 **Handoff:** Tests are ready for Darlene's implementation. When she completes Phase 2 of the transport stability work, these tests will validate her middleware behaves correctly.
+
+### 2026-04-02 — Build Orders 8-10: Messaging System Tests (+54, 264 → 318 total)
+
+**Task:** Write comprehensive pytest tests for Darlene's proactive messaging system (Build Orders 8-10).
+
+**Context:** Darlene implemented SSE infrastructure, team status/events, and outbound event subscriptions. Existing 264 tests passed; new tests needed for all messaging functionality.
+
+**New test file created:** `tests/test_messaging.py` (+54 tests)
+
+**Coverage:**
+
+**Build Order 8 — SSE Infrastructure + State Query Tools (6 tests):**
+- `get_server_stats` returns expected keys (queue_depth, by_status, uptime_sec, active_sse_clients)
+- Queue depth calculation (sum of non-done tasks)
+- By-project grouping in stats
+- `get_project_summary` returns correct totals for a project
+- Missing project arg returns error
+- Overdue count included in project summary
+
+**Build Order 9 — Team Inbound + Notifications (16 tests):**
+- `set_team_status`: valid status succeeds, invalid returns error, empty squad error, with message, upsert behavior
+- `get_team_status`: all teams vs specific team, missing squad error
+- `post_team_event`: valid event persisted, empty/invalid event_type errors, event retrievable
+- `get_team_events`: returns list with count, filters by squad, respects limit, filters by event_type
+- REST API `/notifications`: POST with valid body (201), invalid event_type (400), missing squad (400)
+- REST API `/status`: PUT valid (200), invalid (400), GET all teams, GET specific team or 404
+- REST API `/team/events`: GET returns events, limit respected, filters by squad
+
+**Build Order 10 — Outbound Event Subscriptions (15 tests):**
+- `subscribe_events`: HTTPS succeeds, HTTP rejected, invalid event_type error, interval_sec < 60 error, duplicate id error, SSRF private IP blocked, project filter optional
+- `list_subscriptions`: returns list, filter by subscriber, filter by event_type
+- `unsubscribe_events`: human_approval=False error, human_approval=True deletes, non-existent id error
+- REST API `/subscriptions`: POST returns 201, HTTP URL error, GET returns list, DELETE returns 204, unknown id 404, missing confirm 400
+
+**REST API Integration (6 tests):**
+- SSE endpoint auth enforcement (401 without token)
+- Project summary endpoint returns data
+- Stats endpoint with detailed=true returns extended fields
+
+**Testing strategies:**
+- Mock `socket.getaddrinfo` for SSRF tests (public vs private IP resolution)
+- Use `_sync_wrap` helper to call async tools synchronously in tests
+- REST API tests use Starlette `TestClient` for synchronous endpoint validation
+- Avoided SSE streaming test (would hang) — validated auth enforcement only
+
+**All 318 tests passing** (264 existing + 54 new messaging tests).
+
+**Handoff:** Tests ready for Angela's documentation. All new messaging functionality covered.
+
+### 2026-04-02 — Proactive messaging (Build Orders 8, 9, 10)
+
+**Date:** 2026-04-02  
+**Status:** IMPLEMENTED  
+**Test Results:** 318 tests passing
+
+**Work completed by Darlene:**
+
+Implemented proactive messaging system per Elliot's messaging architecture brief. All 3 build orders complete.
+
+**Build Order 8 — SSE Infrastructure + State Query Tools:**
+- New MCP tools: `get_server_stats()`, `get_project_summary(project)`
+- New REST endpoint: `GET /api/v1/projects/{project}/summary`
+- Enhanced `/api/v1/stats` with subscription counts
+- SSE event bus infrastructure with asyncio.Queue fanout per client
+
+**Build Order 9 — Team Inbound + Notifications:**
+- New tables: `team_status`, `team_events` (with squad/created_at indexes)
+- New MCP tools: `set_team_status`, `get_team_status`, `post_team_event`, `get_team_events`
+- New REST endpoints: `PUT/GET /api/v1/status`, `GET /api/v1/status/{squad}`, `POST /api/v1/events`, `GET /api/v1/team-events`
+- REST `/notifications` endpoint (ephemeral broadcast, no DB storage in v0.2.0)
+- Background health loop (30s) publishing server.health events
+
+**Build Order 10 — Outbound Event Subscriptions:**
+- New table: `event_subscriptions` (with event_type index)
+- New MCP tools: `subscribe_events`, `list_subscriptions`, `unsubscribe_events`
+- New REST endpoints: `POST/GET/DELETE /api/v1/subscriptions`
+- Background subscription firing loop (30s poll, interval_sec per subscription)
+- SSRF validation (HTTPS-only, RFC1918/loopback blocklist)
+- Event delivery to subscribed endpoints with HMAC-SHA256 signing
+
+**Schema additions:** 3 new tables + 3 indexes
+**MCP tools:** 9 new tools (get_server_stats, get_project_summary, set_team_status, get_team_status, post_team_event, get_team_events, subscribe_events, list_subscriptions, unsubscribe_events)
+**REST endpoints:** 12 new/modified endpoints
+
+**Test coverage:** Romero wrote 54 new tests in `tests/test_messaging.py` covering all messaging functionality.
+

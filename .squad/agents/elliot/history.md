@@ -174,3 +174,24 @@ Lead & Architect. I own design decisions and ensure consistency with squad-knowl
 **New MCP tools:** `get_server_stats`, `get_project_summary`, `set_team_status`, `get_team_status`, `post_team_event`, `get_team_events`, `subscribe_events`, `list_subscriptions`, `unsubscribe_events`
 
 **Security review flagged for Dom:** notification payload XSS risk (data field broadcast to SSE clients), squad identity spoofing in POST /notifications (intentional, informational), rate limiting deferred to v0.3.0.
+
+### 2026-04-02 — Proactive messaging system delivery complete
+
+**Date:** 2026-04-02  
+**Status:** DELIVERED  
+**Build Orders:** 8, 9, 10  
+**Test Results:** 318/318 tests passing
+
+**Architect approval:** All 3 build orders complete per design brief. Darlene fully implemented SSE infrastructure, team inbound messaging, and outbound event subscriptions. Romero wrote 54 comprehensive tests covering all new functionality.
+
+**What was delivered:**
+- Build Order 8: SSE infrastructure + state query tools (get_server_stats, get_project_summary, extended /stats endpoint)
+- Build Order 9: Team inbound + notifications (team_status, team_events tables; set/get team status; post/get team events; notifications endpoint)
+- Build Order 10: Outbound subscriptions (event_subscriptions table; subscribe/list/unsubscribe tools; background subscription firing loop with HMAC-SHA256 signing)
+
+**Tables added:** team_status, team_events, event_subscriptions (3 new tables)
+**MCP tools added:** 9 new tools
+**REST endpoints added/modified:** 12 endpoints
+**Test coverage:** 54 new tests (318 total)
+
+**Messaging architecture decision merged to decisions.md** — includes Elliot's full Phase 1-3 architecture, reconciliation with Mobley's protocol design, Andrew's 7 final decisions, and Build Order 8-10 scope.
