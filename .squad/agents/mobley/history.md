@@ -162,3 +162,43 @@ Squad Knowledge Server (SSE) ← Python script → answers + knowledge posts
 - `J:\Coding\open-project-manager-mcp\.squad\answer_opm_questions.py` — working script for answering OPM questions (kept for reference)
 - `J:\Coding\open-project-manager-mcp\.squad\query_sks_sdk.py` — MCP SDK query example (kept for reference)
 
+### 2026-04-02 — REST API Reference Documentation
+
+**Context:** Andrew requested comprehensive REST API reference wiki page covering all `/api/v1` endpoints with examples using the actual OPM server at http://192.168.1.178:8765.
+
+**Deliverable:** `docs/wiki/04-rest-api-reference.md` — complete REST API reference covering:
+
+1. **Authentication & Error Handling** — Bearer token format, error response schema, HTTP status codes
+2. **Health & Stats** — GET /api/v1/stats with detailed and basic modes
+3. **Tasks** — GET/POST/PATCH/DELETE endpoints with full examples
+4. **Projects** — GET /api/v1/projects, GET /api/v1/projects/{id}/summary
+5. **Team Status** — GET/PUT endpoints for squad status management
+6. **Team Events** — POST/GET endpoints for event publishing and querying
+7. **Notifications** — POST /api/v1/notifications with custom payloads
+8. **Subscriptions** — Event webhook subscriptions with periodic HTTP delivery
+9. **Registration** — Self-service POST /api/v1/register with rate limiting, DELETE /api/v1/register/{squad} for deregistration
+10. **SSE Stream** — GET /api/v1/events with event type filtering, connection management, keepalive strategy
+11. **Complete workflow examples** — end-to-end task creation flow, real-time event monitoring
+12. **Security & Troubleshooting** — HTTPS best practices, SSRF protections, common errors
+
+**Key Documentation Patterns:**
+
+- Every endpoint includes: method, path, description, parameters, request/response schemas, curl examples with http://192.168.1.178:8765 server
+- Consistent error format: `{"error": "Error: <description>"}` with HTTP status codes
+- Query parameters, path parameters, and request body fields documented in tables with types and validation rules
+- SSE stream documented with event type descriptions, payload examples, connection lifecycle
+- Rate limiting: 5 req/min for registration endpoint, per-IP tracking in memory
+
+**Technical Details Captured:**
+
+- Task fields: id, title, description, priority (critical/high/medium/low), status (pending/in_progress/done/blocked), project, assignee, tags (array), due_date
+- Team statuses: online, offline, busy, degraded
+- Notification types: squad.status, squad.alert, squad.heartbeat
+- Subscription events: server.stats, server.health, project.summary
+- Registration rate limit: 5 requests/60s per IP (opportunistic cleanup of stale window)
+- Request body cap: 1 MiB to prevent OOM DoS
+- SSE keepalive: 30s timeout with `: keepalive\n\n` messages
+- Squad name validation: regex `^[a-zA-Z0-9_-]{1,64}$`
+
+**Integration with wiki structure:** Placed at `04-rest-api-reference.md` (numbering matches other wiki pages in parallel creation)
+

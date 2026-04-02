@@ -1413,3 +1413,149 @@ None identified. All functionality is comprehensively tested:
 - **File:** `tests/test_messaging.py` (54 tests)
 
 All tests pass with no failures.
+
+## 2026-04-02: OPM Wiki Creation (Angela & Mobley)
+
+### Angela: Wiki Creation Complete
+
+# Angela: Wiki Creation Complete
+
+**Date:** 2026-04-02  
+**Author:** Angela (DevRel & Docs)  
+**Status:** ✅ Complete  
+
+## Summary
+
+Completed creation of comprehensive OPM wiki documentation in `docs/wiki/` with 10 markdown pages covering architecture, quickstart, tools, messaging, auth, onboarding, deployment, and troubleshooting.
+
+## Pages Created
+
+1. **README.md** — Wiki index and TOC (1.9 KB)
+2. **01-what-is-opm.md** — Architecture, SQLite design, MCP protocol, transports (7.2 KB)
+3. **02-quickstart.md** — 7-step setup: token → env var → mcp-config.json → reload → verify (4.6 KB)
+4. **03-mcp-tools-reference.md** — All 24 MCP tools with params, returns, examples (19.4 KB)
+5. **04-rest-api-reference.md** — REST API quick ref + full endpoint table (enhanced existing file)
+6. **05-messaging-system.md** — SSE events, event types, filtering, heartbeat, curl examples (8.7 KB)
+7. **06-auth-and-tokens.md** — Bearer tokens, token generation, env vars, security, registered squads (6.5 KB)
+8. **07-onboarding-a-new-squad.md** — Onboarding steps and common pitfalls (6.1 KB)
+9. **08-deployment-and-ops.md** — Quick ref for skitterphuger: start, health checks, restart, upgrade (5 KB)
+10. **09-troubleshooting.md** — 11 scenarios with diagnosis and fixes (12.8 KB)
+
+**Total:** ~80 KB of documentation
+
+## Audience
+
+- AI agent squads (mrrobot, westworld, fsociety, coordinator, ralph)
+- MCP clients and tools
+- OPM administrators
+
+## Writing Style
+
+- Clear markdown with headers and code blocks
+- Practical curl/bash examples throughout
+- Task-focused (how to do things, not just theory)
+- Comprehensive parameter/return documentation for all tools
+
+## Next Steps for Squad
+
+1. **Ingestion:** Post wiki pages to squad-knowledge server (if desired for cross-project discovery)
+2. **Feedback:** Squads should report any unclear sections or missing details
+3. **Mobley:** Complete the detailed REST API reference (placeholder points to README.md for now)
+4. **Updates:** Add links to wiki from main README.md (optional)
+
+## Notes
+
+- 04-rest-api-reference.md already had detailed content from prior generation; enhanced with quick ref table
+- No code changes; docs reflect existing implementation from prior commits
+- All docs follow MCP and deployment conventions from DEPLOY.md and existing README.md
+- Placeholder for Mobley's REST API work already in place
+
+
+### Mobley: REST API Reference Wiki Completion
+
+# Mobley — REST API Reference Wiki Completion
+
+**Date:** 2026-04-02  
+**Status:** Complete  
+**Artefact:** `docs/wiki/04-rest-api-reference.md`
+
+## Summary
+
+Completed comprehensive REST API reference wiki page covering all `/api/v1` endpoints. Document serves as the source of truth for REST API design, parameters, schemas, and curl examples using the production OPM server at http://192.168.1.178:8765.
+
+## Endpoints Documented
+
+**Health & Stats:**
+- GET /api/v1/stats (with `?detailed=true` variant)
+
+**Tasks (CRUD):**
+- GET /api/v1/tasks (with project/assignee/status/priority/limit/offset filters)
+- POST /api/v1/tasks
+- GET /api/v1/tasks/{task_id}
+- PATCH /api/v1/tasks/{task_id}
+- DELETE /api/v1/tasks/{task_id} (requires `?confirm=true`)
+
+**Projects:**
+- GET /api/v1/projects
+- GET /api/v1/projects/{project_id}/summary
+
+**Team Status:**
+- GET /api/v1/status
+- GET /api/v1/status/{squad}
+- PUT /api/v1/status/{squad}
+
+**Team Events:**
+- POST /api/v1/events
+- GET /api/v1/team/events (with squad/event_type/limit filters)
+
+**Notifications:**
+- POST /api/v1/notifications
+
+**Event Subscriptions:**
+- GET /api/v1/subscriptions (with subscriber/event_type filters)
+- POST /api/v1/subscriptions
+- GET /api/v1/subscriptions/{id}
+- DELETE /api/v1/subscriptions/{id} (requires `?confirm=true`)
+
+**Registration (Self-Service Tokens):**
+- POST /api/v1/register (rate limited 5 req/min per IP)
+- DELETE /api/v1/register/{squad}
+
+**Real-Time Events (SSE):**
+- GET /api/v1/events (long-lived stream with event_type/squad filtering)
+
+## Documentation Coverage
+
+1. **Authentication** — Bearer token format, header inclusion
+2. **Error Handling** — Consistent error response format, HTTP status codes (200, 201, 204, 400, 401, 404, 405, 409, 413, 429, 500)
+3. **Request/Response Schemas** — Parameter tables with types, required fields, validation rules
+4. **curl Examples** — Every endpoint includes realistic curl command with http://192.168.1.178:8765 server
+5. **Complete Workflows** — Task creation flow (create → get → update → delete) and real-time event monitoring
+6. **SSE Connection Management** — Event type descriptions, payload formats, keepalive strategy (30s timeout, `: keepalive\n\n`)
+7. **Rate Limiting & Security** — Registration rate limit (5/min/IP), SSRF protections, HTTPS best practices, token storage security
+8. **Troubleshooting** — Common errors (401, 404, 409, 413, 429, 500) with diagnostic steps
+
+## Technical Decisions Preserved
+
+- **Request body cap:** 1 MiB to prevent OOM DoS attacks
+- **Squad name validation:** regex `^[a-zA-Z0-9_-]{1,64}$`
+- **Registration rate limiting:** In-memory window (60s), opportunistic stale key eviction to prevent unbounded dict growth
+- **SSE keepalive:** 30-second timeout with `: keepalive\n\n` messages
+- **Subscription event types:** server.stats, server.health, project.summary (matches VALID_SUBSCRIPTION_EVENTS in server.py)
+- **Notification types:** squad.status, squad.alert, squad.heartbeat (matches VALID_NOTIFICATION_TYPES)
+- **Task statuses:** pending, in_progress, done, blocked
+- **Team statuses:** online, offline, busy, degraded
+- **Priorities:** critical, high, medium, low
+- **Pagination:** limit 1–500 (default 20), offset-based
+
+## Dependencies
+
+- Extracted from `src/open_project_manager_mcp/server.py` REST router implementation
+- Validated against actual OPM server behavior
+- No external dependencies or assumptions
+
+## Next Steps
+
+- Angela to complete parallel wiki page creation
+- Cross-reference REST API page in main README.md if needed
+- Periodically update documentation when new endpoints are added
