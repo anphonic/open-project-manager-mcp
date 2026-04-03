@@ -236,18 +236,30 @@ def create_server(
     _bg_health_task: Optional[asyncio.Task] = None
     _bg_sub_task: Optional[asyncio.Task] = None
 
-    async def _locked_write(coro_fn):
-        """Acquire _lock with 30s timeout, run coro_fn(), release. Returns error string on timeout."""
+    # ------------------------------------------------------------------
+    # Async database helpers — wrap sqlite3 calls to avoid blocking event loop
+    # ------------------------------------------------------------------
+
+    async def _db_execute(query: str, params: tuple = ()) -> list:
+        """Execute a SELECT query and return all rows (runs in thread pool)."""
+        return await asyncio.to_thread(lambda: conn.execute(query, params).fetchall())
+
+    async def _db_execute_one(query: str, params: tuple = ()) -> dict | None:
+        """Execute a SELECT query and return one row or None (runs in thread pool)."""
+        return await asyncio.to_thread(lambda: conn.execute(query, params).fetchone())
+
+    async def _locked_write(write_fn):
+        """Acquire _lock with 30s timeout, run write_fn in thread pool, release. Returns error string on timeout."""
         try:
             await asyncio.wait_for(_lock.acquire(), timeout=30.0)
         except asyncio.TimeoutError:
             return "Error: write operation timed out waiting for lock — server may need restart"
         try:
-            return await coro_fn()
+            return await asyncio.to_thread(write_fn)
         finally:
             _lock.release()
 
-    def _verify_bearer(token: str) -> str | None:
+    async def _verify_bearer(token: str) -> str | None:
         """Return tenant_id if token is valid, else None. Env var keys take precedence."""
         # 1. Env var keys — checked first
         if tenant_keys:
@@ -257,7 +269,7 @@ def create_server(
         # 2. DB-registered keys — re-queried on every call (no restart needed)
         # Note: DB keys grant REST API access only; MCP access requires OPM_TENANT_KEYS.
         try:
-            rows = conn.execute("SELECT squad, key FROM tenant_keys").fetchall()
+            rows = await _db_execute("SELECT squad, key FROM tenant_keys", ())
         except sqlite3.Error:
             return None
         for row in rows:
@@ -380,26 +392,25 @@ def create_server(
         while True:
             await asyncio.sleep(30)
             try:
-                rows = conn.execute(
+                rows = await _db_execute(
                     "SELECT id, subscriber, url, event_type, project, interval_sec"
                     " FROM event_subscriptions"
                     " WHERE enabled = 1 AND interval_sec IS NOT NULL"
                     " AND (last_fired_at IS NULL"
                     "      OR datetime(last_fired_at, '+' || interval_sec || ' seconds')"
-                    "         <= datetime('now'))"
-                ).fetchall()
+                    "         <= datetime('now'))",
+                    (),
+                )
             except Exception:
                 continue
             for row in rows:
                 event_type = row["event_type"]
                 try:
                     if event_type == "server.stats":
-                        by_status = {
-                            r["status"]: r["cnt"]
-                            for r in conn.execute(
-                                "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
-                            ).fetchall()
-                        }
+                        by_status_rows = await _db_execute(
+                            "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status", ()
+                        )
+                        by_status = {r["status"]: r["cnt"] for r in by_status_rows}
                         payload = {
                             "queue_depth": sum(v for k, v in by_status.items() if k != "done"),
                             "by_status": by_status,
@@ -407,19 +418,17 @@ def create_server(
                         }
                     elif event_type == "project.summary":
                         project = row["project"] or ""
-                        by_status = {
-                            r["status"]: r["cnt"]
-                            for r in conn.execute(
-                                "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
-                                (project,),
-                            ).fetchall()
-                        }
+                        by_status_rows = await _db_execute(
+                            "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
+                            (project,),
+                        )
+                        by_status = {r["status"]: r["cnt"] for r in by_status_rows}
                         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                        overdue_row = conn.execute(
+                        overdue_row = await _db_execute_one(
                             "SELECT COUNT(*) as cnt FROM tasks"
                             " WHERE project = ? AND due_date IS NOT NULL AND due_date < ? AND status != 'done'",
                             (project, today),
-                        ).fetchone()
+                        )
                         payload = {
                             "project": project,
                             "total": sum(by_status.values()),
@@ -448,24 +457,22 @@ def create_server(
             return
         _bg_sub_task = asyncio.create_task(_subscriptions_loop())
 
-    def _project_summary(project: str) -> str:
+    async def _project_summary(project: str) -> str:
         """Shared logic for project summary — used by MCP tool and REST endpoint."""
         if not project or len(project) > _MAX_SHORT_FIELD:
             return f"Error: 'project' is required and must be under {_MAX_SHORT_FIELD} characters"
         try:
-            by_status = {
-                r["status"]: r["cnt"]
-                for r in conn.execute(
-                    "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
-                    (project,),
-                ).fetchall()
-            }
+            by_status_rows = await _db_execute(
+                "SELECT status, COUNT(*) as cnt FROM tasks WHERE project = ? GROUP BY status",
+                (project,),
+            )
+            by_status = {r["status"]: r["cnt"] for r in by_status_rows}
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            overdue_row = conn.execute(
+            overdue_row = await _db_execute_one(
                 "SELECT COUNT(*) as cnt FROM tasks"
                 " WHERE project = ? AND due_date IS NOT NULL AND due_date < ? AND status != 'done'",
                 (project, today),
-            ).fetchone()
+            )
         except sqlite3.Error:
             return "Error: database error reading project summary"
         total = sum(by_status.values())
@@ -702,7 +709,7 @@ def create_server(
         now = _now()
         tags_json = json.dumps(tags) if tags else None
         
-        async def _do_write():
+        def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO tasks"
@@ -779,7 +786,7 @@ def create_server(
             return f"Error: internal error — unknown field(s): {', '.join(sorted(unknown))}"
         actor = _get_actor()
         
-        async def _do_write():
+        def _do_write():
             old_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if old_row is None:
                 return f"Error: task '{task_id}' not found"
@@ -821,7 +828,7 @@ def create_server(
         """Mark a task as done."""
         actor = _get_actor()
         
-        async def _do_write():
+        def _do_write():
             old_row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if old_row is None:
                 return f"Error: task '{task_id}' not found"
@@ -854,7 +861,7 @@ def create_server(
             return "Error: human_approval=True is required to delete a task"
         actor = _get_actor()
         
-        async def _do_write():
+        def _do_write():
             row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
                 return f"Error: task '{task_id}' not found"
@@ -886,34 +893,30 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def get_task(task_id: str) -> str:
+    async def get_task(task_id: str) -> str:
         """Get a single task by ID, including its dependency info."""
         try:
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            row = await _db_execute_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
             if row is None:
                 return f"Error: task '{task_id}' not found"
             task = _row(row)
-            task["depends_on"] = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
-                ).fetchall()
-            ]
-            task["blocked_by"] = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT td.depends_on FROM task_deps td"
-                    " JOIN tasks t ON td.depends_on = t.id"
-                    " WHERE td.task_id = ? AND t.status != 'done'",
-                    (task_id,),
-                ).fetchall()
-            ]
+            depends_on_rows = await _db_execute(
+                "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
+            )
+            task["depends_on"] = [r[0] for r in depends_on_rows]
+            blocked_by_rows = await _db_execute(
+                "SELECT td.depends_on FROM task_deps td"
+                " JOIN tasks t ON td.depends_on = t.id"
+                " WHERE td.task_id = ? AND t.status != 'done'",
+                (task_id,),
+            )
+            task["blocked_by"] = [r[0] for r in blocked_by_rows]
             return json.dumps(task)
         except sqlite3.Error:
             return "Error: database error reading task"
 
     @mcp.tool()
-    def list_tasks(
+    async def list_tasks(
         project: Optional[str] = None,
         assignee: Optional[str] = None,
         status: Optional[str] = None,
@@ -940,11 +943,11 @@ def create_server(
             params.append(priority)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT id, title, priority, status, assignee FROM tasks"
                 f" {where} ORDER BY {_PRIORITY_CASE}, created_at LIMIT ? OFFSET ?",
-                params + [limit + 1, offset],
-            ).fetchall()
+                tuple(params + [limit + 1, offset]),
+            )
         except sqlite3.Error:
             return "Error: database error listing tasks"
         has_more = len(rows) > limit
@@ -965,7 +968,7 @@ def create_server(
             return "Error: a task cannot depend on itself"
         actor = _get_actor()
         
-        async def _do_write():
+        def _do_write():
             if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
                 return f"Error: task '{task_id}' not found"
             if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (depends_on_id,)).fetchone():
@@ -991,7 +994,7 @@ def create_server(
         """Remove a dependency edge between two tasks."""
         actor = _get_actor()
         
-        async def _do_write():
+        def _do_write():
             cur = conn.execute(
                 "DELETE FROM task_deps WHERE task_id = ? AND depends_on = ?",
                 (task_id, depends_on_id),
@@ -1008,7 +1011,7 @@ def create_server(
         return json.dumps({"task_id": task_id, "depends_on": depends_on_id, "removed": True})
 
     @mcp.tool()
-    def list_ready_tasks(
+    async def list_ready_tasks(
         project: Optional[str] = None,
         assignee: Optional[str] = None,
         limit: int = 10,
@@ -1028,7 +1031,7 @@ def create_server(
         where = f"WHERE {' AND '.join(conditions)}"
         priority_case = _PRIORITY_CASE.replace("priority", "t.priority")
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"""
                 SELECT t.id, t.title, t.priority, t.status, t.assignee FROM tasks t
                 {where}
@@ -1040,8 +1043,8 @@ def create_server(
                 ORDER BY {priority_case}, t.created_at
                 LIMIT ?
                 """,
-                params + [limit],
-            ).fetchall()
+                tuple(params + [limit]),
+            )
         except sqlite3.Error:
             return "Error: database error listing ready tasks"
         return json.dumps({"tasks": [dict(r) for r in rows], "count": len(rows)})
@@ -1051,15 +1054,16 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def list_projects() -> str:
+    async def list_projects() -> str:
         """List all projects with open and total task counts."""
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 "SELECT project,"
                 " COUNT(*) as total,"
                 " SUM(CASE WHEN status != 'done' THEN 1 ELSE 0 END) as open"
-                " FROM tasks GROUP BY project ORDER BY project"
-            ).fetchall()
+                " FROM tasks GROUP BY project ORDER BY project",
+                (),
+            )
         except sqlite3.Error:
             return "Error: database error listing projects"
         return json.dumps({
@@ -1070,24 +1074,20 @@ def create_server(
         })
 
     @mcp.tool()
-    def get_stats() -> str:
+    async def get_stats() -> str:
         """Task counts by status and priority, plus the age of the oldest open item."""
         try:
-            by_status = {
-                r["status"]: r["cnt"]
-                for r in conn.execute(
-                    "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
-                ).fetchall()
-            }
-            by_priority = {
-                r["priority"]: r["cnt"]
-                for r in conn.execute(
-                    "SELECT priority, COUNT(*) as cnt FROM tasks WHERE status != 'done' GROUP BY priority"
-                ).fetchall()
-            }
-            oldest = conn.execute(
-                "SELECT MIN(created_at) as oldest FROM tasks WHERE status != 'done'"
-            ).fetchone()
+            by_status_rows = await _db_execute(
+                "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status", ()
+            )
+            by_status = {r["status"]: r["cnt"] for r in by_status_rows}
+            by_priority_rows = await _db_execute(
+                "SELECT priority, COUNT(*) as cnt FROM tasks WHERE status != 'done' GROUP BY priority", ()
+            )
+            by_priority = {r["priority"]: r["cnt"] for r in by_priority_rows}
+            oldest = await _db_execute_one(
+                "SELECT MIN(created_at) as oldest FROM tasks WHERE status != 'done'", ()
+            )
         except sqlite3.Error:
             return "Error: database error reading stats"
         return json.dumps({
@@ -1097,19 +1097,18 @@ def create_server(
         })
 
     @mcp.tool()
-    def get_server_stats() -> str:
+    async def get_server_stats() -> str:
         """Get server statistics: task counts, uptime, and active SSE connections."""
         try:
-            by_status = {
-                r["status"]: r["cnt"]
-                for r in conn.execute(
-                    "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
-                ).fetchall()
-            }
+            by_status_rows = await _db_execute(
+                "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status", ()
+            )
+            by_status = {r["status"]: r["cnt"] for r in by_status_rows}
             by_project: dict[str, dict] = {}
-            for r in conn.execute(
-                "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status"
-            ).fetchall():
+            project_rows = await _db_execute(
+                "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status", ()
+            )
+            for r in project_rows:
                 by_project.setdefault(r["project"], {})[r["status"]] = r["cnt"]
         except sqlite3.Error:
             return "Error: database error reading server stats"
@@ -1123,9 +1122,9 @@ def create_server(
         })
 
     @mcp.tool()
-    def get_project_summary(project: str) -> str:
+    async def get_project_summary(project: str) -> str:
         """Get a task summary for a specific project, including overdue count."""
-        return _project_summary(project)
+        return await _project_summary(project)
 
     # ------------------------------------------------------------------
     # Feature 8: Team status & events
@@ -1142,7 +1141,7 @@ def create_server(
             return f"Error: 'message' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
         now = _now()
         
-        async def _do_write():
+        def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO team_status (squad, status, message, updated_at)"
@@ -1163,20 +1162,20 @@ def create_server(
         return json.dumps({"squad": squad, "status": status, "message": message, "updated_at": now})
 
     @mcp.tool()
-    def get_team_status(squad: Optional[str] = None) -> str:
+    async def get_team_status(squad: Optional[str] = None) -> str:
         """Get current status for all squads or a specific squad."""
         try:
             if squad:
-                row = conn.execute(
+                row = await _db_execute_one(
                     "SELECT squad, status, message, updated_at FROM team_status WHERE squad = ?",
                     (squad,),
-                ).fetchone()
+                )
                 if row is None:
                     return f"Error: squad '{squad}' not found"
                 return json.dumps(dict(row))
-            rows = conn.execute(
-                "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad"
-            ).fetchall()
+            rows = await _db_execute(
+                "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad", ()
+            )
         except sqlite3.Error:
             return "Error: database error reading team status"
         return json.dumps({"squads": [dict(r) for r in rows]})
@@ -1192,7 +1191,7 @@ def create_server(
             return f"Error: 'data' exceeds maximum length of {_MAX_DESCRIPTION} characters"
         now = _now()
         
-        async def _do_write():
+        def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO team_events (squad, event_type, data, created_at) VALUES (?, ?, ?, ?)",
@@ -1210,7 +1209,7 @@ def create_server(
         return json.dumps({"squad": squad, "event_type": event_type, "created_at": now})
 
     @mcp.tool()
-    def get_team_events(
+    async def get_team_events(
         squad: Optional[str] = None,
         event_type: Optional[str] = None,
         limit: int = 50,
@@ -1227,11 +1226,11 @@ def create_server(
             params.append(event_type)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT id, squad, event_type, data, created_at FROM team_events"
                 f" {where} ORDER BY created_at DESC LIMIT ?",
-                params + [limit],
-            ).fetchall()
+                tuple(params + [limit]),
+            )
         except sqlite3.Error:
             return "Error: database error reading team events"
         return json.dumps({"events": [dict(r) for r in rows], "count": len(rows)})
@@ -1263,7 +1262,7 @@ def create_server(
             if interval_sec < _SUB_MIN_INTERVAL or interval_sec > _SUB_MAX_INTERVAL:
                 return f"Error: interval_sec must be between {_SUB_MIN_INTERVAL} and {_SUB_MAX_INTERVAL}"
         
-        async def _do_write():
+        def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO event_subscriptions"
@@ -1288,7 +1287,7 @@ def create_server(
         })
 
     @mcp.tool()
-    def list_subscriptions(
+    async def list_subscriptions(
         subscriber: Optional[str] = None,
         event_type: Optional[str] = None,
     ) -> str:
@@ -1303,12 +1302,12 @@ def create_server(
             params.append(event_type)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT id, subscriber, url, event_type, project, interval_sec,"
                 f" enabled, last_fired_at, created_at"
                 f" FROM event_subscriptions {where} ORDER BY created_at",
-                params,
-            ).fetchall()
+                tuple(params),
+            )
         except sqlite3.Error:
             return "Error: database error listing subscriptions"
         return json.dumps({"subscriptions": [dict(r) for r in rows]})
@@ -1318,11 +1317,17 @@ def create_server(
         """Delete an event subscription. Requires human_approval=True."""
         if not human_approval:
             return "Error: human_approval=True is required to delete a subscription"
-        async with _lock:
+        
+        def _do_write():
             cur = conn.execute("DELETE FROM event_subscriptions WHERE id = ?", (id,))
             conn.commit()
             if cur.rowcount == 0:
                 return f"Error: subscription '{id}' not found"
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"id": id, "deleted": True})
 
     # ------------------------------------------------------------------
@@ -1330,7 +1335,7 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def list_overdue_tasks(
+    async def list_overdue_tasks(
         project: Optional[str] = None,
         assignee: Optional[str] = None,
         limit: int = 20,
@@ -1354,17 +1359,17 @@ def create_server(
         where = f"WHERE {' AND '.join(conditions)}"
         priority_case = _PRIORITY_CASE
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT id, title, priority, status, due_date FROM tasks"
                 f" {where} ORDER BY {priority_case}, due_date ASC LIMIT ?",
-                params + [limit],
-            ).fetchall()
+                tuple(params + [limit]),
+            )
         except sqlite3.Error:
             return "Error: database error listing overdue tasks"
         return json.dumps({"tasks": [dict(r) for r in rows], "count": len(rows)})
 
     @mcp.tool()
-    def list_due_soon_tasks(
+    async def list_due_soon_tasks(
         days: int = 7,
         project: Optional[str] = None,
         assignee: Optional[str] = None,
@@ -1392,11 +1397,11 @@ def create_server(
         where = f"WHERE {' AND '.join(conditions)}"
         priority_case = _PRIORITY_CASE
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT id, title, priority, status, due_date FROM tasks"
                 f" {where} ORDER BY {priority_case}, due_date ASC LIMIT ?",
-                params + [limit],
-            ).fetchall()
+                tuple(params + [limit]),
+            )
         except sqlite3.Error:
             return "Error: database error listing due-soon tasks"
         return json.dumps({"tasks": [dict(r) for r in rows], "count": len(rows)})
@@ -1406,7 +1411,7 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def search_tasks(
+    async def search_tasks(
         query: str,
         project: Optional[str] = None,
         status: Optional[str] = None,
@@ -1428,15 +1433,15 @@ def create_server(
             params.append(status)
         extra_where = (" AND " + " AND ".join(conditions)) if conditions else ""
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 f"SELECT t.id, t.title, t.priority, t.status, t.assignee"
                 f" FROM tasks_fts"
                 f" JOIN tasks t ON tasks_fts.rowid = t.rowid"
                 f" WHERE tasks_fts MATCH ?"
                 f"{extra_where}"
                 f" ORDER BY rank LIMIT ?",
-                params + [limit + 1],
-            ).fetchall()
+                tuple(params + [limit + 1]),
+            )
         except sqlite3.Error:
             return "Error: search failed — invalid query syntax"
         has_more = len(rows) > limit
@@ -1458,7 +1463,7 @@ def create_server(
         created: list[str] = []
         errors: list[dict] = []
         
-        async def _do_write():
+        def _do_write():
             for item in tasks:
                 tid = item.get("id", "")
                 err = _validate_create_params(
@@ -1527,7 +1532,7 @@ def create_server(
         updated: list[str] = []
         errors: list[dict] = []
         
-        async def _do_write():
+        def _do_write():
             for item in updates:
                 task_id = item.get("task_id", "")
                 if not task_id:
@@ -1597,7 +1602,7 @@ def create_server(
         completed: list[str] = []
         not_found: list[str] = []
         
-        async def _do_write():
+        def _do_write():
             for task_id in ids:
                 row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if row is None:
@@ -1622,16 +1627,16 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def get_task_activity(task_id: str, limit: int = 50) -> str:
+    async def get_task_activity(task_id: str, limit: int = 50) -> str:
         """Get the activity history for a task, newest first."""
         limit = max(1, min(limit, 200))
         # Activity log is orphan-safe — query it directly even if task was deleted.
         try:
-            rows = conn.execute(
+            rows = await _db_execute(
                 "SELECT id, action, field, old_value, new_value, actor, created_at"
                 " FROM activity_log WHERE task_id = ? ORDER BY created_at DESC LIMIT ?",
                 (task_id, limit),
-            ).fetchall()
+            )
         except sqlite3.Error:
             return "Error: database error reading activity log"
         return json.dumps({
@@ -1640,12 +1645,12 @@ def create_server(
         })
 
     @mcp.tool()
-    def get_activity_log(project: Optional[str] = None, limit: int = 50) -> str:
+    async def get_activity_log(project: Optional[str] = None, limit: int = 50) -> str:
         """Get recent activity across all tasks (or filtered by project)."""
         limit = max(1, min(limit, 200))
         try:
             if project:
-                rows = conn.execute(
+                rows = await _db_execute(
                     "SELECT al.id, al.task_id, al.action, al.field, al.old_value,"
                     " al.new_value, al.actor, al.created_at"
                     " FROM activity_log al"
@@ -1653,13 +1658,13 @@ def create_server(
                     " WHERE t.project = ?"
                     " ORDER BY al.created_at DESC LIMIT ?",
                     (project, limit),
-                ).fetchall()
+                )
             else:
-                rows = conn.execute(
+                rows = await _db_execute(
                     "SELECT id, task_id, action, field, old_value, new_value, actor, created_at"
                     " FROM activity_log ORDER BY created_at DESC LIMIT ?",
                     (limit,),
-                ).fetchall()
+                )
         except sqlite3.Error:
             return "Error: database error reading activity log"
         return json.dumps({"activity": [dict(r) for r in rows], "count": len(rows)})
@@ -1669,26 +1674,26 @@ def create_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def export_all_tasks(project: Optional[str] = None) -> str:
+    async def export_all_tasks(project: Optional[str] = None) -> str:
         """Export tasks (and their dependencies) to a portable JSON string."""
         try:
             if project:
-                rows = conn.execute(
+                rows = await _db_execute(
                     "SELECT * FROM tasks WHERE project = ? ORDER BY created_at", (project,)
-                ).fetchall()
+                )
             else:
-                rows = conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall()
+                rows = await _db_execute("SELECT * FROM tasks ORDER BY created_at", ())
             task_ids = {r["id"] for r in rows}
             tasks_list = [_row(r) for r in rows]
             if project and task_ids:
                 placeholders = ",".join("?" * len(task_ids))
-                dep_rows = conn.execute(
+                dep_rows = await _db_execute(
                     f"SELECT task_id, depends_on FROM task_deps"
                     f" WHERE task_id IN ({placeholders}) AND depends_on IN ({placeholders})",
-                    list(task_ids) + list(task_ids),
-                ).fetchall()
+                    tuple(list(task_ids) + list(task_ids)),
+                )
             elif not project:
-                dep_rows = conn.execute("SELECT task_id, depends_on FROM task_deps").fetchall()
+                dep_rows = await _db_execute("SELECT task_id, depends_on FROM task_deps", ())
             else:
                 dep_rows = []
         except sqlite3.Error as exc:
@@ -1738,7 +1743,7 @@ def create_server(
         skipped = 0
         errs: list[dict] = []
         
-        async def _do_write():
+        def _do_write():
             nonlocal imported, skipped
             if not merge:
                 conflicts = [
@@ -1841,7 +1846,7 @@ def create_server(
         if invalid_events:
             return f"Error: invalid events: {', '.join(sorted(invalid_events))}. Valid: {', '.join(sorted(VALID_WEBHOOK_EVENTS))}"
         
-        async def _do_write():
+        def _do_write():
             try:
                 conn.execute(
                     "INSERT INTO webhooks (id, url, project, events, secret, enabled, created_at)"
@@ -1861,18 +1866,18 @@ def create_server(
         return json.dumps({"id": id, "url": url, "events": events, "project": project})
 
     @mcp.tool()
-    def list_webhooks(project: Optional[str] = None) -> str:
+    async def list_webhooks(project: Optional[str] = None) -> str:
         """List registered webhooks. Secrets are never returned."""
         try:
             if project:
-                rows = conn.execute(
+                rows = await _db_execute(
                     "SELECT id, url, project, events, enabled FROM webhooks WHERE project = ? ORDER BY created_at",
                     (project,),
-                ).fetchall()
+                )
             else:
-                rows = conn.execute(
-                    "SELECT id, url, project, events, enabled FROM webhooks ORDER BY created_at"
-                ).fetchall()
+                rows = await _db_execute(
+                    "SELECT id, url, project, events, enabled FROM webhooks ORDER BY created_at", ()
+                )
         except sqlite3.Error:
             return "Error: database error listing webhooks"
         webhooks = []
@@ -1890,11 +1895,17 @@ def create_server(
         """Delete a webhook registration. Requires human_approval=True."""
         if not human_approval:
             return "Error: human_approval=True is required to delete a webhook"
-        async with _lock:
+        
+        def _do_write():
             cur = conn.execute("DELETE FROM webhooks WHERE id = ?", (id,))
             conn.commit()
             if cur.rowcount == 0:
                 return f"Error: webhook '{id}' not found"
+            return None
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
         return json.dumps({"id": id, "deleted": True})
 
     # ------------------------------------------------------------------
@@ -1935,7 +1946,8 @@ def create_server(
                 # not "open to everyone".
                 if not tenant_keys and not os.environ.get("OPM_REGISTRATION_KEY"):
                     try:
-                        has_db_keys = bool(conn.execute("SELECT 1 FROM tenant_keys LIMIT 1").fetchone())
+                        has_db_keys_row = await _db_execute_one("SELECT 1 FROM tenant_keys LIMIT 1", ())
+                        has_db_keys = bool(has_db_keys_row)
                     except sqlite3.Error:
                         has_db_keys = False
                     if not has_db_keys:
@@ -1945,7 +1957,7 @@ def create_server(
                 if not auth_header.startswith("Bearer "):
                     return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
                 token = auth_header[7:]
-                tenant_id = _verify_bearer(token)
+                tenant_id = await _verify_bearer(token)
                 if tenant_id:
                     return tenant_id, None
                 return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -1999,11 +2011,11 @@ def create_server(
                         params.append(priority)
                     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
                     try:
-                        rows = conn.execute(
+                        rows = await _db_execute(
                             f"SELECT id, title, priority, status, assignee FROM tasks"
                             f" {where} ORDER BY {_PRIORITY_CASE}, created_at LIMIT ? OFFSET ?",
-                            params + [limit + 1, offset],
-                        ).fetchall()
+                            tuple(params + [limit + 1, offset]),
+                        )
                     except sqlite3.Error:
                         return JSONResponse({"error": "Error: database error"}, status_code=500)
                     has_more = len(rows) > limit
@@ -2039,7 +2051,7 @@ def create_server(
                         return JSONResponse({"error": tags_err}, status_code=400)
                     tags_json = json.dumps(tags) if tags else None
                     
-                    async def _do_write():
+                    def _do_write():
                         try:
                             conn.execute(
                                 "INSERT INTO tasks"
@@ -2081,22 +2093,20 @@ def create_server(
                     return err
                 task_id = request.path_params["id"]
                 if request.method == "GET":
-                    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                    row = await _db_execute_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
                     if row is None:
                         return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
                     task = _row(row)
-                    task["depends_on"] = [
-                        r[0] for r in conn.execute(
-                            "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
-                        ).fetchall()
-                    ]
-                    task["blocked_by"] = [
-                        r[0] for r in conn.execute(
-                            "SELECT td.depends_on FROM task_deps td JOIN tasks t ON td.depends_on = t.id"
-                            " WHERE td.task_id = ? AND t.status != 'done'",
-                            (task_id,),
-                        ).fetchall()
-                    ]
+                    depends_on_rows = await _db_execute(
+                        "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
+                    )
+                    task["depends_on"] = [r[0] for r in depends_on_rows]
+                    blocked_by_rows = await _db_execute(
+                        "SELECT td.depends_on FROM task_deps td JOIN tasks t ON td.depends_on = t.id"
+                        " WHERE td.task_id = ? AND t.status != 'done'",
+                        (task_id,),
+                    )
+                    task["blocked_by"] = [r[0] for r in blocked_by_rows]
                     return JSONResponse(task)
                 elif request.method == "PATCH":
                     body, body_err = await _read_json_body(request)
@@ -2125,7 +2135,7 @@ def create_server(
                     if not upd:
                         return JSONResponse({"error": "Error: no fields to update"}, status_code=400)
                     
-                    async def _do_write():
+                    def _do_write():
                         old_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
                         if old_row is None:
                             return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
@@ -2161,7 +2171,7 @@ def create_server(
                     if not confirm:
                         return JSONResponse({"error": "Error: confirm=true is required to delete a task"}, status_code=400)
                     
-                    async def _do_write():
+                    def _do_write():
                         row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
                         if row is None:
                             return JSONResponse({"error": f"Error: task '{task_id}' not found"}, status_code=404)
@@ -2188,11 +2198,12 @@ def create_server(
                 if err:
                     return err
                 try:
-                    rows = conn.execute(
+                    rows = await _db_execute(
                         "SELECT project, COUNT(*) as total,"
                         " SUM(CASE WHEN status != 'done' THEN 1 ELSE 0 END) as open"
-                        " FROM tasks GROUP BY project ORDER BY project"
-                    ).fetchall()
+                        " FROM tasks GROUP BY project ORDER BY project",
+                        (),
+                    )
                 except sqlite3.Error:
                     return JSONResponse({"error": "Error: database error"}, status_code=500)
                 return JSONResponse({
@@ -2208,21 +2219,17 @@ def create_server(
                     return err
                 detailed = request.query_params.get("detailed", "").lower() == "true"
                 try:
-                    by_status = {
-                        r["status"]: r["cnt"]
-                        for r in conn.execute(
-                            "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"
-                        ).fetchall()
-                    }
-                    by_priority = {
-                        r["priority"]: r["cnt"]
-                        for r in conn.execute(
-                            "SELECT priority, COUNT(*) as cnt FROM tasks WHERE status != 'done' GROUP BY priority"
-                        ).fetchall()
-                    }
-                    oldest = conn.execute(
-                        "SELECT MIN(created_at) as oldest FROM tasks WHERE status != 'done'"
-                    ).fetchone()
+                    by_status_rows = await _db_execute(
+                        "SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status", ()
+                    )
+                    by_status = {r["status"]: r["cnt"] for r in by_status_rows}
+                    by_priority_rows = await _db_execute(
+                        "SELECT priority, COUNT(*) as cnt FROM tasks WHERE status != 'done' GROUP BY priority", ()
+                    )
+                    by_priority = {r["priority"]: r["cnt"] for r in by_priority_rows}
+                    oldest = await _db_execute_one(
+                        "SELECT MIN(created_at) as oldest FROM tasks WHERE status != 'done'", ()
+                    )
                 except sqlite3.Error:
                     return JSONResponse({"error": "Error: database error"}, status_code=500)
                 result: dict = {
@@ -2235,9 +2242,10 @@ def create_server(
                     result["active_sse_clients"] = len(_event_bus_clients)
                     try:
                         by_project: dict[str, dict] = {}
-                        for r in conn.execute(
-                            "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status"
-                        ).fetchall():
+                        project_rows = await _db_execute(
+                            "SELECT project, status, COUNT(*) as cnt FROM tasks GROUP BY project, status", ()
+                        )
+                        for r in project_rows:
                             by_project.setdefault(r["project"], {})[r["status"]] = r["cnt"]
                         result["by_project"] = by_project
                     except sqlite3.Error:
@@ -2397,7 +2405,7 @@ def create_server(
                 if err:
                     return err
                 project = request.path_params["project"]
-                return _tool_resp(_project_summary(project))
+                return _tool_resp(await _project_summary(project))
 
             async def notifications_endpoint(request: Request) -> JSONResponse:
                 actor, err = await _check_auth(request)
@@ -2418,15 +2426,21 @@ def create_server(
                             status_code=400,
                         )
                     now = _now()
-                    async with _lock:
+                    
+                    def _do_write():
                         try:
                             conn.execute(
                                 "INSERT INTO team_events (squad, event_type, data, created_at) VALUES (?, ?, ?, ?)",
                                 (squad, event_type, json.dumps(data) if data is not None else None, now),
                             )
                             conn.commit()
+                            return None
                         except sqlite3.Error:
-                            return JSONResponse({"error": "Error: database error"}, status_code=500)
+                            return "Error: database error"
+                    
+                    result = await _locked_write(_do_write)
+                    if result:
+                        return JSONResponse({"error": result}, status_code=500)
                     _publish_event(event_type, {"squad": squad, "data": data})
                     return JSONResponse({"squad": squad, "event_type": event_type, "created_at": now}, status_code=201)
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
@@ -2436,9 +2450,9 @@ def create_server(
                 if err:
                     return err
                 try:
-                    rows = conn.execute(
-                        "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad"
-                    ).fetchall()
+                    rows = await _db_execute(
+                        "SELECT squad, status, message, updated_at FROM team_status ORDER BY squad", ()
+                    )
                 except sqlite3.Error:
                     return JSONResponse({"error": "Error: database error"}, status_code=500)
                 return JSONResponse({"squads": [dict(r) for r in rows]})
@@ -2450,10 +2464,10 @@ def create_server(
                 squad = request.path_params["squad"]
                 if request.method == "GET":
                     try:
-                        row = conn.execute(
+                        row = await _db_execute_one(
                             "SELECT squad, status, message, updated_at FROM team_status WHERE squad = ?",
                             (squad,),
-                        ).fetchone()
+                        )
                     except sqlite3.Error:
                         return JSONResponse({"error": "Error: database error"}, status_code=500)
                     if row is None:
@@ -2509,11 +2523,11 @@ def create_server(
                     params.append(event_type)
                 where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
                 try:
-                    rows = conn.execute(
+                    rows = await _db_execute(
                         f"SELECT id, squad, event_type, data, created_at FROM team_events"
                         f" {where} ORDER BY created_at DESC LIMIT ?",
-                        params + [limit],
-                    ).fetchall()
+                        tuple(params + [limit]),
+                    )
                 except sqlite3.Error:
                     return JSONResponse({"error": "Error: database error"}, status_code=500)
                 return JSONResponse({"events": [dict(r) for r in rows], "count": len(rows)})
@@ -2536,12 +2550,12 @@ def create_server(
                         params.append(event_type)
                     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
                     try:
-                        rows = conn.execute(
+                        rows = await _db_execute(
                             f"SELECT id, subscriber, url, event_type, project, interval_sec,"
                             f" enabled, last_fired_at, created_at"
                             f" FROM event_subscriptions {where} ORDER BY created_at",
-                            params,
-                        ).fetchall()
+                            tuple(params),
+                        )
                     except sqlite3.Error:
                         return JSONResponse({"error": "Error: database error"}, status_code=500)
                     return JSONResponse({"subscriptions": [dict(r) for r in rows]})
@@ -2580,7 +2594,7 @@ def create_server(
                                 status_code=400,
                             )
                     
-                    async def _do_write():
+                    def _do_write():
                         try:
                             conn.execute(
                                 "INSERT INTO event_subscriptions"
@@ -2613,12 +2627,12 @@ def create_server(
                 sub_id = request.path_params["id"]
                 if request.method == "GET":
                     try:
-                        row = conn.execute(
+                        row = await _db_execute_one(
                             "SELECT id, subscriber, url, event_type, project, interval_sec,"
                             " enabled, last_fired_at, created_at"
                             " FROM event_subscriptions WHERE id = ?",
                             (sub_id,),
-                        ).fetchone()
+                        )
                     except sqlite3.Error:
                         return JSONResponse({"error": "Error: database error"}, status_code=500)
                     if row is None:
@@ -2629,16 +2643,16 @@ def create_server(
                     if not confirm:
                         return JSONResponse({"error": "Error: confirm=true is required"}, status_code=400)
                     
-                    async def _do_write():
+                    def _do_write():
                         cur = conn.execute("DELETE FROM event_subscriptions WHERE id = ?", (sub_id,))
                         conn.commit()
                         if cur.rowcount == 0:
-                            return JSONResponse({"error": f"Error: subscription '{sub_id}' not found"}, status_code=404)
+                            return f"Error: subscription '{sub_id}' not found"
                         return None
                     
                     result = await _locked_write(_do_write)
                     if result:
-                        return result
+                        return JSONResponse({"error": result}, status_code=404 if "not found" in result else 500)
                     return JSONResponse({"id": sub_id, "deleted": True})
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
