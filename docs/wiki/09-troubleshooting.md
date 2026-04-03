@@ -213,12 +213,14 @@ Address already in use: ('0.0.0.0', 8765)
 curl: (7) Failed to connect to 192.168.1.178 port 8765: Connection timeout
 ```
 
-### Causes
+### Causes (v0.2.1+)
 
-- Event loop deadlock
+**Note:** As of v0.2.1, all SQLite calls are non-blocking (via `asyncio.to_thread()`). Concurrent reads and writes no longer block the event loop. If you were experiencing hangs in v0.2.0, upgrade to v0.2.1 or later.
+
+Remaining causes:
 - High memory usage causing swap
 - Network interface issue
-- Infinite loop in a tool
+- Infinite loop in a tool (rare)
 
 ### Diagnosis
 
@@ -237,16 +239,29 @@ curl: (7) Failed to connect to 192.168.1.178 port 8765: Connection timeout
    timeout 5 curl -v http://192.168.1.178:8765/api/v1/stats
    ```
 
+4. Check OPM version:
+   ```bash
+   pip show open-project-manager-mcp | grep Version
+   ```
+
 ### Fixes
 
-1. **Force restart:**
+1. **Upgrade to v0.2.1 or later (if hanging persists):**
+   ```bash
+   pip install --upgrade open-project-manager-mcp
+   pkill -9 -f open-project-manager
+   sleep 2
+   ./start.sh
+   ```
+
+2. **Force restart:**
    ```bash
    pkill -9 -f open-project-manager
    sleep 2
    ./start.sh
    ```
 
-2. **If memory is very high (> 1GB):** Clear the database cache:
+3. **If memory is very high (> 1GB):** Clear the database cache:
    ```bash
    # Backup first
    cp opm.db opm.db.backup
@@ -257,7 +272,7 @@ curl: (7) Failed to connect to 192.168.1.178 port 8765: Connection timeout
    ./start.sh
    ```
 
-3. **Check disk space:**
+4. **Check disk space:**
    ```bash
    df -h /home/skitterphuger/mcp/open-project-manager/
    ```

@@ -185,7 +185,7 @@ Choose one of the three methods below, in order of preference:
 If the repository is hosted on GitHub/GitLab and the server has internet access:
 
 ```bash
-pip install --upgrade "git+https://github.com/<owner>/open-project-manager-mcp.git@<commit-or-tag>"
+pip install --upgrade "git+https://github.com/anphonic/open-project-manager-mcp.git@<commit-or-tag>"
 ```
 
 **Steps:**

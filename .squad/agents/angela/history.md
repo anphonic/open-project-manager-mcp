@@ -126,4 +126,42 @@ The coordinator (GitHub Copilot CLI) wrote all packaging and documentation direc
 
 **No code changes — docs reflect existing OPM implementation from prior commits.**
 
+### 2026-04-02 — Concurrency fix & v0.3.0 roadmap documentation
+
+**Task:** Update documentation to reflect two major recent changes:
+1. P0 Concurrency Fix (v0.2.1 — already deployed)
+2. v0.3.0 Roadmap (planned features)
+
+**Actions taken:**
+
+- **docs/wiki/09-troubleshooting.md** — Updated "OPM Hanging / Unresponsive" section:
+  - Added note that v0.2.1 fixed event loop deadlock via `asyncio.to_thread()`
+  - Removed "Event loop deadlock" from causes list
+  - Added version check in diagnosis steps
+  - Added upgrade path for users on v0.2.0
+  - Clarified which causes remain (high memory, network, infinite loop)
+
+- **README.md** — Added two new sections:
+  - **"Stability & Recent Improvements"** — Highlights v0.2.1 concurrency fix with technical details (async helpers, thread pool, all 28 tools, bearer token fix)
+  - **"Coming in v0.3.0"** — Brief 2-bullet roadmap (Telemetry, Project Permissions) with note "Stay tuned"
+  - Link to troubleshooting guide for hang details
+
+- **CHARTER.md** — Updated header and added new "Implementation Status (v0.2.1)" section:
+  - Changed status line to "v0.2.1 deployed — production-ready task queue with async SQLite and team coordination"
+  - Added "Completed (v0.2.0 — v0.2.1)" subsection with checkmarks:
+    - 24 MCP tools ✅
+    - 344 passing tests ✅
+    - 21 REST endpoints ✅
+    - P0 Concurrency Fix (v0.2.1) ✅ with technical details
+    - Production deployment on skitterphuger ✅
+  - Added "Planned (v0.3.0)" subsection (Telemetry, Project Permissions) with 🚧 markers
+  - Resolved open questions (multi-squad isolation, GitHub sync, squad integration, hosting)
+
+**No code changes — documentation only.**
+
 ## Learnings
+
+- P0 Concurrency Fix is critical stability marker; users upgrading from v0.2.0 should know to expect better behavior (no hangs on concurrent operations)
+- v0.3.0 roadmap intentionally brief; do not document unimplemented features in detail
+- CHARTER.md should track both completed work and open design questions, helping future developers understand project maturity
+- Troubleshooting docs are first place users look when experiencing issues; update them proactively when known issues are fixed

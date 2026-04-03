@@ -2,7 +2,7 @@
 
 ## Project Scope & Charter
 
-**Status:** Pre-development — scoping phase  
+**Status:** v0.2.1 deployed — production-ready task queue with async SQLite and team coordination  
 **Origin:** Identified during squad-knowledge-mcp development (session 2026-03-31)
 
 ---
@@ -176,14 +176,43 @@ GitHub Issues remains valuable for public-facing project tracking and @copilot i
 
 ---
 
-## Open Questions
+## Implementation Status (v0.2.1)
 
-1. **Multi-squad isolation**: Should tasks be tenant-scoped (like squad-knowledge-mcp SQUAD_TENANT_KEYS)? Or is project-scoping sufficient for v1?
-2. **GitHub sync**: Should there be a one-way sync mode that mirrors GitHub Issues into this server for offline/fast Ralph access? Separate tool or built-in?
-3. **Squad integration**: Should Ralph check this server first via list_ready_tasks, then GitHub Issues as fallback? Or treat them as separate queues?
-4. **Hosting**: Co-located with squad-knowledge-mcp on skitterphuger, or separate deploy per project?
+### Completed (v0.2.0 — v0.2.1)
+
+✅ **24 MCP tools** — All planned tools shipped:
+- Task CRUD (5), Dependencies (4), Bulk ops (3), Search (3), Due dates (2), Projects (2), Activity (2), Export/Import (2), Webhooks (3)
+- Team coordination (9), Subscriptions (2), Stats (1)
+
+✅ **344 passing tests** — Full test coverage across all tools
+
+✅ **REST API** — All 21 endpoints operational
+
+✅ **P0 Concurrency Fix (v0.2.1)** — All SQLite calls non-blocking via `asyncio.to_thread()`:
+- 28 tools converted to `async def`
+- `_db_execute()` and `_db_execute_one()` async helpers
+- `_locked_write()` serializes writes without blocking event loop
+- Bearer token verification async
+
+✅ **Production Deployment** — Running on skitterphuger (192.168.1.178:8765) serving 5+ squads
+
+### Planned (v0.3.0)
+
+🚧 **Telemetry** — Per-tenant usage metrics (hourly buckets), accessible via MCP tools
+
+🚧 **Project Permissions** — Per-project ACL (owner/contributor/reader); 8 new MCP tools
 
 ---
 
-*Charter created: 2026-03-31*
+## Open Questions
+
+1. **Multi-squad isolation** (resolved): Tenant-keyed via Bearer token (per SQUAD_TENANT_KEYS). Project-scoping is per-tenant.
+2. **GitHub sync**: Should there be a one-way sync mode? Separate integration concern — defer to v1.1.
+3. **Squad integration**: Ralph uses `list_ready_tasks` as primary source, GitHub as fallback — working well.
+4. **Hosting**: Co-located on skitterphuger with squad-knowledge-mcp ✅
+
+---
+
+*Charter created: 2026-03-31*  
+*Last updated: 2026-04-02 (v0.2.1 stability release)*  
 *Based on squad-knowledge-mcp architecture decisions and cross-squad field experience*

@@ -582,6 +582,33 @@ register_webhook(
 | — | `OPM_TENANT_KEYS` | unset | JSON object of bearer tokens: `{"squad": {"key": "token"}}` |
 | — | `OPM_REGISTRATION_KEY` | unset | Shared secret for `POST /api/v1/register` self-service token registration. If unset, registration endpoint returns 404. Requires `--rest-api`. |
 
+## Stability & Recent Improvements
+
+**v0.2.1 — Concurrency Fix (Latest)**
+
+All SQLite operations are now fully non-blocking via `asyncio.to_thread()`. Concurrent reads/writes no longer block the event loop. If you were experiencing hangs with concurrent operations in v0.2.0, upgrade to v0.2.1 or later.
+
+**What was fixed:**
+- All 28 MCP tools converted to `async def`
+- SQLite calls offloaded to thread pool (`_db_execute()`, `_db_execute_one()`)
+- `_locked_write()` now handles write serialization without blocking event loop
+- Bearer token verification made async
+
+See [Troubleshooting — OPM Hanging](docs/wiki/09-troubleshooting.md#opm-hanging--unresponsive) for details.
+
+---
+
+## Coming in v0.3.0
+
+Two major features are planned:
+
+1. **Telemetry** — Per-tenant usage metrics (hourly buckets), accessible via new MCP tools
+2. **Project Permissions** — Per-project ACL with owner/contributor/reader roles; 8 new MCP tools for project management
+
+Stay tuned for release announcements.
+
+---
+
 ## Development
 
 ```bash
