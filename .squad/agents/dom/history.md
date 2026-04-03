@@ -56,3 +56,37 @@ Dom was not directly invoked this session. Darlene implemented multi-tenant bear
 
 **Open item — DNS rebinding:**
 Registration-time SSRF check only. A low-TTL DNS rebinding attack could pivot a registered HTTPS webhook URL to an internal address after registration. Flagged for Elliot: decision needed — re-validate hostname on each webhook fire vs accept HTTPS certificate validation as sufficient mitigation. Recorded in `.squad/decisions.md`.
+
+### 2026-04-03 — Project-Level Permissions Design
+
+**Request:** Andrew requested a full security model for project-level data privacy and permissions. Current state: bearer tokens identify squads, but `project` is just a filter string — any squad can read/write any project's tasks.
+
+**Deliverable:** `.squad/decisions/inbox/dom-project-permissions-design.md`
+
+**Key design decisions:**
+1. **Per-project ACL model** — simpler than RBAC or capability tokens for our 3-10 squad scale
+2. **Three roles:** owner (full control), contributor (task CRUD), reader (view-only)
+3. **Explicit project creation** — no implicit creation via `create_task`; projects must exist first
+4. **Private by default** — new projects accessible only to creator until grants made
+5. **Single enforcement layer** — `_check_project_access()` helper prevents scattered checks across 23+ tools
+
+**Threat model covers:**
+- Cross-squad data access, project squatting, task injection, enumeration, notification leakage
+- Privilege escalation paths: role confusion, self-grant, orphan projects
+- Edge cases: non-existent project, cross-project deps, move task between projects
+
+**Open questions for Elliot:**
+- Admin override squad (OPM_ADMIN_SQUAD)?
+- Cross-project dependencies allowed?
+- Notification system composability
+- Default project fate (open/migrate/deprecate)
+
+**Schema additions:** `projects` table, `project_access` table with CHECK constraint on roles.
+
+## Learnings
+
+- OPM currently has ~30 MCP tools plus REST endpoints — access control must use single helper to avoid repetition
+- `_get_actor()` already extracts squad from bearer token context; this becomes the ACL principal
+- Activity log (`activity_log` table) captures `actor` — useful for migration (determine who created tasks)
+- Webhooks have optional `project` field — access checks needed both at registration and fire time
+- Migration is the hardest part: existing tasks have project strings but no ownership metadata

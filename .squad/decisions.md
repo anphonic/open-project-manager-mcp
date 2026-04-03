@@ -2172,3 +2172,1043 @@ Could use low-level TCP socket inspection to detect RST/FIN.
 - [x] Darlene (Implementer) — Feasibility confirmed, implementation complete
 - [x] Romero (Tester) — All 12 session reaper tests passing
 
+
+
+---
+
+## 2026-04-03: Telemetry + Push Notifications Architecture (Elliot)
+
+# Telemetry + Push Notifications Architecture
+
+**Author:** Elliot (Lead & Architect)  
+**Date:** 2026-04-03  
+**Status:** PROPOSED  
+**For:** Andrew (project owner)  
+**Implements:** Per-tenant telemetry + coordinator push notifications
+
+---
+
+## Problem Statement
+
+Andrew has requested two related capabilities:
+
+1. **Per-tenant telemetry** — Track activity/completions per squad so coordinators can see team throughput over time (tasks created, completed, updated).
+
+2. **Push notifications to coordinators** — When a task is updated/completed, notify the coordinator directly rather than requiring polling.
+
+Andrew's specific question: *"when the MCP server is setup so that the connected clients are notifiable — is that the SSE? if so we need a way to keep track of everyone who needs notified."*
+
+---
+
+## Current State Analysis
+
+### What We Have
+
+| Capability | Description | Limitation |
+|------------|-------------|------------|
+| `activity_log` table | Per-task audit trail (action, field, old/new values, actor, timestamp) | Task-scoped, not tenant-aggregated |
+| `GET /api/v1/events` (SSE) | Real-time push to connected clients | Ephemeral — only works when connected |
+| `webhooks` table | HTTP callbacks on task events | Requires coordinator to run HTTP server |
+| `event_subscriptions` table | Periodic/on-change delivery to URLs | Also requires HTTP endpoint |
+| `team_events` table | Squad-posted events (milestones, alerts) | Inbound from squads, not system-generated |
+| `_event_bus_clients` list | In-memory list of SSE asyncio.Queues | No metadata about WHO is connected |
+
+### Key Insight
+
+The `_event_bus_clients` list is **anonymous** — it's just a list of queues, with no information about which tenant connected. We can't target "send this to coordinator X" because we don't know which queue belongs to which tenant.
+
+---
+
+## A. Telemetry Schema
+
+### New Table: `telemetry_metrics`
+
+```sql
+CREATE TABLE IF NOT EXISTS telemetry_metrics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    squad       TEXT    NOT NULL,          -- tenant/squad identifier
+    metric_type TEXT    NOT NULL,          -- 'task.created', 'task.completed', etc.
+    project     TEXT,                      -- optional project filter
+    count       INTEGER NOT NULL DEFAULT 0,
+    period_start TEXT   NOT NULL,          -- ISO 8601 (hourly bucket start)
+    period_end   TEXT   NOT NULL,          -- ISO 8601 (hourly bucket end)
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS telemetry_squad_metric_period_idx 
+    ON telemetry_metrics(squad, metric_type, project, period_start);
+CREATE INDEX IF NOT EXISTS telemetry_squad_idx ON telemetry_metrics(squad);
+CREATE INDEX IF NOT EXISTS telemetry_period_idx ON telemetry_metrics(period_start DESC);
+```
+
+### Why Hourly Buckets?
+
+- **Efficient querying:** One row per (squad, metric, hour) vs one row per event
+- **Bounded growth:** Max 24 rows/day per (squad, metric) vs unbounded
+- **Aggregation flexibility:** Roll up to daily/weekly at query time
+- **Privacy-preserving:** Counts, not individual event details
+
+### Metrics Tracked
+
+| metric_type | Description | Source |
+|-------------|-------------|--------|
+| `task.created` | Tasks created by this squad | `create_task` MCP tool |
+| `task.completed` | Tasks completed by this squad | `complete_task` MCP tool |
+| `task.updated` | Tasks updated by this squad | `update_task` MCP tool |
+| `task.deleted` | Tasks deleted by this squad | `delete_task` MCP tool |
+
+### Recording Logic
+
+Inner helper `_record_telemetry(squad: str, metric_type: str, project: Optional[str])`:
+
+```python
+def _record_telemetry(squad: str, metric_type: str, project: Optional[str]) -> None:
+    """Increment hourly telemetry bucket for squad+metric."""
+    now = datetime.now(timezone.utc)
+    # Bucket to hour boundary
+    period_start = now.replace(minute=0, second=0, microsecond=0).isoformat()
+    period_end = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
+    
+    conn.execute("""
+        INSERT INTO telemetry_metrics (squad, metric_type, project, count, period_start, period_end, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT(squad, metric_type, project, period_start) 
+        DO UPDATE SET count = count + 1, updated_at = ?
+    """, (squad, metric_type, project, period_start, period_end, now.isoformat(), now.isoformat(), now.isoformat()))
+    conn.commit()
+```
+
+### Telemetry API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/telemetry` | GET | Get telemetry for authenticated squad |
+| `/api/v1/telemetry/{squad}` | GET | Get telemetry for specific squad (admin only) |
+| `/api/v1/telemetry/summary` | GET | Aggregated totals across all squads (admin only) |
+
+### MCP Tools
+
+```python
+@mcp.tool()
+def get_my_telemetry(
+    metric_type: Optional[str] = None,  # filter by metric
+    project: Optional[str] = None,      # filter by project
+    hours: int = 24,                    # lookback window
+    limit: int = 100
+) -> str:
+    """Get telemetry metrics for the calling squad."""
+    
+@mcp.tool()
+def get_squad_telemetry(
+    squad: str,                         # target squad
+    metric_type: Optional[str] = None,
+    hours: int = 24,
+    limit: int = 100
+) -> str:
+    """Get telemetry for a specific squad. Requires admin scope."""
+```
+
+### Response Format
+
+```json
+{
+  "squad": "mrrobot",
+  "period": {
+    "start": "2026-04-02T00:00:00+00:00",
+    "end": "2026-04-03T00:00:00+00:00"
+  },
+  "totals": {
+    "task.created": 42,
+    "task.completed": 38,
+    "task.updated": 156,
+    "task.deleted": 3
+  },
+  "by_hour": [
+    {"period_start": "2026-04-02T14:00:00+00:00", "task.created": 5, "task.completed": 3},
+    {"period_start": "2026-04-02T15:00:00+00:00", "task.created": 8, "task.completed": 7}
+  ]
+}
+```
+
+---
+
+## B. Push Notification Mechanism
+
+### The Core Problem
+
+Andrew asked: *"we need a way to keep track of everyone who needs notified."*
+
+The challenge:
+
+| Mechanism | Who can be notified? | When? |
+|-----------|---------------------|-------|
+| SSE (`/api/v1/events`) | Only currently connected clients | While connected |
+| Webhooks | Anyone with an HTTPS endpoint | When OPM can reach the URL |
+| MCP session | Only during active MCP request | Request scope only |
+
+**Key finding:** MCP's streamable-HTTP transport uses SSE for server→client messages, but FastMCP manages this internally. We cannot inject messages into arbitrary MCP sessions.
+
+### Architecture Decision: Hybrid Model
+
+After analyzing the tradeoffs, I recommend a **3-tier notification system**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           PUSH NOTIFICATION TIERS                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  TIER 1: SSE Event Stream (Real-time, connected clients)                │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Coordinator connects: GET /api/v1/events?squad=mrrobot         │   │
+│  │  OPM pushes events instantly while connection is open           │   │
+│  │  Zero latency, no polling, but requires active connection       │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  TIER 2: Webhook Delivery (Guaranteed delivery, async)                  │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Coordinator registers: POST /api/v1/webhooks                   │   │
+│  │  OPM POSTs to webhook URL on task events                        │   │
+│  │  Reliable but requires coordinator to run HTTP server           │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  TIER 3: Message Queue (Pull-based, persistent)                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Messages stored in DB with TTL                                 │   │
+│  │  Coordinator polls: list_pending_messages MCP tool              │   │
+│  │  Works even if coordinator was offline when event occurred      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Tier 1: Enhanced SSE with Client Registry
+
+**New Table: `sse_clients`**
+
+```sql
+CREATE TABLE IF NOT EXISTS sse_clients (
+    id           TEXT    PRIMARY KEY,      -- uuid4
+    squad        TEXT    NOT NULL,         -- authenticated tenant
+    connected_at TEXT    NOT NULL,         -- ISO 8601
+    last_seen    TEXT    NOT NULL,         -- heartbeat timestamp
+    filter_event TEXT,                     -- optional event filter
+    filter_squad TEXT,                     -- optional squad filter
+    user_agent   TEXT                      -- client identification
+);
+
+CREATE INDEX IF NOT EXISTS sse_clients_squad_idx ON sse_clients(squad);
+```
+
+**Why a DB table instead of in-memory?**
+
+- Survives server restart (coordinator can reconnect, knows its connection was lost)
+- Queryable ("who is currently connected?")
+- Can be inspected by admin tools
+- Supports distributed deployment (future)
+
+**Implementation changes to `events_endpoint`:**
+
+```python
+async def events_endpoint(request: Request) -> Response:
+    actor, err = await _check_auth(request)
+    if err:
+        return err
+    
+    client_id = str(uuid.uuid4())
+    now = _now()
+    
+    # Register client in DB
+    conn.execute("""
+        INSERT INTO sse_clients (id, squad, connected_at, last_seen, filter_event, filter_squad, user_agent)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (client_id, actor, now, now, 
+          request.query_params.get("event_type"),
+          request.query_params.get("squad"),
+          request.headers.get("User-Agent", "")))
+    conn.commit()
+    
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _event_bus_clients[client_id] = {"queue": q, "squad": actor}  # Changed from list to dict
+    
+    async def event_stream():
+        try:
+            while True:
+                # ... existing logic ...
+                # Update last_seen on heartbeat
+                conn.execute("UPDATE sse_clients SET last_seen = ? WHERE id = ?", (_now(), client_id))
+        finally:
+            # Unregister on disconnect
+            del _event_bus_clients[client_id]
+            conn.execute("DELETE FROM sse_clients WHERE id = ?", (client_id,))
+            conn.commit()
+```
+
+**New MCP Tool: `list_connected_clients`**
+
+```python
+@mcp.tool()
+def list_connected_clients(squad: Optional[str] = None) -> str:
+    """List currently connected SSE clients. Admin only."""
+```
+
+### Tier 2: Webhooks (Already Implemented)
+
+The existing webhook system is the right mechanism for guaranteed delivery:
+
+```
+Coordinator registers:
+  POST /api/v1/webhooks
+  {"url": "https://coordinator.example.com/events", "events": ["task.completed"]}
+
+On task.completed:
+  OPM fires: POST https://coordinator.example.com/events
+  With HMAC-SHA256 signature
+```
+
+**No changes needed** — webhooks already work for this use case.
+
+### Tier 3: Message Queue (NEW)
+
+For coordinators that can't run HTTP servers and aren't always connected to SSE:
+
+**New Table: `pending_notifications`**
+
+```sql
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient    TEXT    NOT NULL,         -- target squad (coordinator)
+    event_type   TEXT    NOT NULL,         -- 'task.completed', etc.
+    payload      TEXT    NOT NULL,         -- JSON event data
+    created_at   TEXT    NOT NULL,
+    expires_at   TEXT    NOT NULL,         -- TTL (default: 7 days)
+    read_at      TEXT                      -- NULL until acknowledged
+);
+
+CREATE INDEX IF NOT EXISTS pending_notif_recipient_idx ON pending_notifications(recipient, read_at);
+CREATE INDEX IF NOT EXISTS pending_notif_expires_idx ON pending_notifications(expires_at);
+```
+
+**MCP Tools:**
+
+```python
+@mcp.tool()
+def list_pending_notifications(
+    event_type: Optional[str] = None,
+    unread_only: bool = True,
+    limit: int = 50
+) -> str:
+    """List pending notifications for the calling squad."""
+
+@mcp.tool()
+def acknowledge_notifications(notification_ids: list[int]) -> str:
+    """Mark notifications as read."""
+```
+
+**Event Flow:**
+
+```
+1. Task completed by squad "mrrobot"
+2. OPM determines coordinator is "squad-coordinator" 
+   (from task.assignee or project owner mapping)
+3. OPM inserts into pending_notifications
+4. If coordinator has SSE connection → push immediately
+5. If coordinator has webhook → fire webhook
+6. Notification persists until acknowledged or expired
+```
+
+---
+
+## C. Connected Client Registry
+
+### Schema
+
+See `sse_clients` table above. This is the **client registry** Andrew asked about.
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Per-connection, not per-tenant** | One squad can have multiple connections (coordinator + agents) |
+| **DB-backed, not in-memory only** | Queryable, survives restart, supports future clustering |
+| **Includes filters** | Know what each client is listening for |
+| **Updates `last_seen` on heartbeat** | Detect zombie connections |
+
+### Query Patterns
+
+```sql
+-- Who is currently connected?
+SELECT squad, COUNT(*) as connections FROM sse_clients GROUP BY squad;
+
+-- Is coordinator squad connected?
+SELECT 1 FROM sse_clients WHERE squad = 'coordinator' LIMIT 1;
+
+-- Clean up stale connections (no heartbeat in 5 minutes)
+DELETE FROM sse_clients WHERE last_seen < datetime('now', '-5 minutes');
+```
+
+### Targeted Notification Logic
+
+```python
+def _notify_coordinator(squad: str, event: dict) -> None:
+    """Send notification to a specific squad via best available channel."""
+    
+    # 1. Check for SSE connection
+    for client_id, info in _event_bus_clients.items():
+        if info["squad"] == squad:
+            try:
+                info["queue"].put_nowait(event)
+                return  # Delivered via SSE
+            except asyncio.QueueFull:
+                pass  # Queue full, fall through
+    
+    # 2. Fire webhooks for this squad's registered hooks
+    # (existing _fire_webhooks logic, filtered by squad)
+    
+    # 3. Persist to pending_notifications as fallback
+    _queue_notification(squad, event)
+```
+
+---
+
+## D. Scope Recommendation
+
+### v0.3.0 (Immediate)
+
+| Feature | Tables | Tools | Endpoints | Priority |
+|---------|--------|-------|-----------|----------|
+| Telemetry schema | `telemetry_metrics` | `get_my_telemetry`, `get_squad_telemetry` | `/api/v1/telemetry` | HIGH |
+| SSE client registry | `sse_clients` | `list_connected_clients` | (existing `/events` modified) | HIGH |
+| Pending notifications | `pending_notifications` | `list_pending_notifications`, `acknowledge_notifications` | `/api/v1/notifications` | HIGH |
+
+**Estimated work:** 2-3 days (Darlene implementation + Romero tests)
+
+### v0.3.1 (Follow-up)
+
+| Feature | Description |
+|---------|-------------|
+| Telemetry pruning | Background task to aggregate old hourly data into daily rollups |
+| Notification routing | Explicit "coordinator" concept — who to notify for each project |
+| Retry for failed webhooks | Queue failed deliveries, exponential backoff |
+| Cross-squad visibility controls | Which squads can see which telemetry |
+
+### v0.4.0+ (Future)
+
+| Feature | Description |
+|---------|-------------|
+| Dashboard UI | Web UI showing telemetry graphs, connected clients |
+| Notification preferences | Per-squad opt-in/out for event types |
+| Distributed OPM | Multiple server instances sharing state via PostgreSQL |
+
+---
+
+## Summary
+
+| Question | Answer |
+|----------|--------|
+| **A. Telemetry schema** | `telemetry_metrics` table with hourly buckets, unique index on (squad, metric, project, period_start) |
+| **B. Push mechanism** | 3-tier: SSE (instant/connected), Webhooks (guaranteed/async), Message queue (persistent/polling) |
+| **C. Client registry** | `sse_clients` table with squad, filters, last_seen; dict-based `_event_bus_clients` for in-memory routing |
+| **D. v0.3.0 scope** | Telemetry + SSE registry + pending notifications. Routing logic, pruning, retries in v0.3.1. |
+
+---
+
+## Build Order
+
+1. **BO-11: Telemetry schema + recording** — Table, `_record_telemetry()` helper, wire into `create_task`/`complete_task`/etc.
+2. **BO-12: Telemetry API** — `get_my_telemetry`, `get_squad_telemetry` tools + REST endpoint
+3. **BO-13: SSE client registry** — `sse_clients` table, modify `events_endpoint`, `list_connected_clients` tool
+4. **BO-14: Pending notifications** — Table, `_queue_notification()` helper, `list_pending_notifications`, `acknowledge_notifications`
+5. **BO-15: Unified notification dispatch** — `_notify_coordinator()` that tries SSE → webhooks → queue
+
+**Dependencies:**
+- BO-12 depends on BO-11
+- BO-14 depends on BO-13
+- BO-15 depends on BO-13 + BO-14
+
+---
+
+**Next Step:** Andrew approves or modifies this design, then I brief Darlene on implementation.
+
+
+---
+
+## 2026-04-03: Project-Level Data Privacy & Permissions Design (Dom)
+
+# Project-Level Data Privacy & Permissions Design
+
+**Author:** Dom DiPierro (Security Expert)  
+**Date:** 2026-04-03  
+**Status:** PROPOSED  
+**Priority:** P1 — Security/Privacy  
+
+---
+
+## Executive Summary
+
+This design introduces project-level access control to OPM. Currently, any squad with a valid bearer token can read/write tasks in ANY project. The new model ensures projects are owned by a specific squad, and access must be explicitly granted to others.
+
+---
+
+## A. Threat Model
+
+### Current State Vulnerabilities
+
+| Threat | Description | Severity | Current Mitigation |
+|--------|-------------|----------|-------------------|
+| **Cross-squad data access** | fsociety can read/modify mrrobot's tasks | HIGH | None — `project` is just a filter string |
+| **Project squatting** | Squad A creates `project=secrets` before Squad B can | MEDIUM | None |
+| **Task injection** | Malicious squad creates misleading tasks in another squad's project | HIGH | None |
+| **Reconnaissance** | Any squad can enumerate all projects via `list_tasks` with no filter | MEDIUM | None |
+| **Notification leakage** | Webhooks/subscriptions may fire to unauthorized squads | MEDIUM | None |
+| **Activity log exposure** | `get_activity_log` exposes all projects' history | MEDIUM | None |
+
+### Privilege Escalation Paths (If Poorly Designed)
+
+1. **Role confusion:** If roles are case-insensitive (`Owner` vs `owner`), ACL bypass possible
+2. **Default-open migration:** If existing projects default to "open", instant exposure
+3. **Implicit project creation:** If `create_task(project="new-secret")` auto-creates project with creator as owner, task-creator becomes project-owner
+4. **Token sharing:** If squads share tokens, we can't distinguish principals
+5. **Self-grant:** Can a contributor grant themselves owner? Must be prevented
+6. **Orphan projects:** If owner squad is deleted, who inherits? Deny-all vs admin override?
+
+### Edge Cases to Handle
+
+- Squad creates task in non-existent project → REJECT (project must exist first)
+- Squad lists tasks without project filter → Return ONLY tasks in accessible projects
+- Owner revokes own access → Prevent (last owner must remain)
+- Move task between projects → Requires write on source AND destination
+- Export includes projects caller can't access → Filter results
+- Webhook fires for task update → Only to squads with read access
+
+---
+
+## B. Permission Model: ACL per Project
+
+### Recommendation: **Per-Project ACL**
+
+After evaluating options:
+
+| Model | Pros | Cons |
+|-------|------|------|
+| **ACL per project** | Simple, explicit, matches mental model | N×M entries possible |
+| RBAC (global roles) | Reusable roles | Over-engineered for 3-10 squads |
+| Capability tokens | Fine-grained | Token management burden; changes auth flow |
+
+**Chosen: Per-Project ACL with three role levels**
+
+```
+owner       → full control (grant/revoke, delete project, all task ops)
+contributor → create/update/delete tasks in project
+reader      → read-only access to project's tasks
+```
+
+### Design Principles
+
+1. **Projects must be explicitly created** — no implicit creation via `create_task`
+2. **Creator = initial owner** — the squad that creates a project owns it
+3. **Default: private** — new projects accessible only to owner until grants are made
+4. **Multiple owners allowed** — prevents orphan projects
+5. **Token = identity** — bearer token maps to squad, squad maps to ACL entries
+
+---
+
+## C. Schema DDL
+
+```sql
+-- Projects: explicit project registry (no more implicit project strings)
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,               -- e.g., "mrrobot-auth"
+    name        TEXT NOT NULL,                  -- human-readable name
+    description TEXT,
+    created_by  TEXT NOT NULL,                  -- squad that created it
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS projects_created_by_idx ON projects(created_by);
+
+-- Project access control list
+CREATE TABLE IF NOT EXISTS project_access (
+    project_id  TEXT NOT NULL,
+    squad       TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK (role IN ('owner', 'contributor', 'reader')),
+    granted_by  TEXT NOT NULL,                  -- who granted this access
+    granted_at  TEXT NOT NULL,
+    PRIMARY KEY (project_id, squad),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS project_access_squad_idx ON project_access(squad);
+
+-- Migration: add project_id FK to tasks (soft migration — allows legacy NULLs temporarily)
+-- ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id);
+-- We'll handle this via migration path below
+```
+
+### Schema Notes
+
+- `role` uses CHECK constraint — SQLite enforces at INSERT/UPDATE
+- Cascade delete: removing project removes all access entries
+- `granted_by` provides audit trail for compliance questions
+- No `UNIQUE(project_id, squad)` needed — PK handles it
+
+### FTS Consideration
+
+No FTS changes required — search results will be filtered by access check after retrieval.
+
+---
+
+## D. Enforcement Points
+
+### Core Principle: Single Enforcement Layer
+
+**All access checks go through one helper function** — not scattered across 23 tools.
+
+```python
+def _check_project_access(
+    squad: str, 
+    project_id: str, 
+    required_role: str,  # 'owner', 'contributor', 'reader'
+) -> bool:
+    """Return True if squad has required_role (or higher) on project_id.
+    
+    Role hierarchy: owner > contributor > reader
+    """
+    if not project_id:
+        return False
+    
+    try:
+        row = conn.execute(
+            "SELECT role FROM project_access WHERE project_id = ? AND squad = ?",
+            (project_id, squad)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    
+    if not row:
+        return False
+    
+    actual_role = row['role']
+    
+    # Role hierarchy check
+    role_levels = {'reader': 1, 'contributor': 2, 'owner': 3}
+    return role_levels.get(actual_role, 0) >= role_levels.get(required_role, 999)
+
+
+def _require_project_access(project_id: str, required_role: str) -> str | None:
+    """Return error string if access denied, None if allowed."""
+    squad = _get_actor()
+    if squad == 'system':
+        return None  # system context (internal ops, migrations)
+    
+    if not _check_project_access(squad, project_id, required_role):
+        return f"Error: access denied to project '{project_id}'"
+    
+    return None
+
+
+def _get_accessible_projects(squad: str, min_role: str = 'reader') -> list[str]:
+    """Return list of project_ids that squad can access with at least min_role."""
+    role_levels = {'reader': 1, 'contributor': 2, 'owner': 3}
+    min_level = role_levels.get(min_role, 1)
+    
+    rows = conn.execute(
+        "SELECT project_id, role FROM project_access WHERE squad = ?"
+        (squad,)
+    ).fetchall()
+    
+    return [r['project_id'] for r in rows 
+            if role_levels.get(r['role'], 0) >= min_level]
+```
+
+### Tool-Level Enforcement
+
+| Tool | Required Role | Enforcement Location |
+|------|--------------|---------------------|
+| `create_task` | contributor | At entry, before INSERT |
+| `update_task` | contributor | At entry, lookup task's project first |
+| `delete_task` | contributor | At entry, lookup task's project first |
+| `get_task` | reader | At entry, lookup task's project first |
+| `list_tasks` | reader | Filter WHERE clause or post-filter |
+| `list_ready_tasks` | reader | Filter WHERE clause |
+| `search_tasks` | reader | Post-filter FTS results |
+| `add_dependency` | contributor (on both) | Check both tasks' projects |
+| `get_activity_log` | reader | Filter by accessible projects |
+| `export_tasks` | reader | Filter exported data |
+| `import_tasks` | contributor | Per-project check in import |
+| `create_tasks` (bulk) | contributor | Per-task project check |
+| `update_tasks` (bulk) | contributor | Per-task project check |
+| `complete_tasks` (bulk) | contributor | Per-task project check |
+| `register_webhook` | reader (for project filter) | Webhook sees only accessible events |
+
+### REST API Enforcement
+
+Same pattern — `_check_auth` already returns `actor`; add access check after:
+
+```python
+async def _handle_get_tasks(request: Request):
+    actor, err = await _check_auth(request)
+    if err:
+        return err
+    
+    project = request.query_params.get("project")
+    if project:
+        access_err = _require_project_access(project, 'reader')
+        if access_err:
+            return JSONResponse({"error": access_err}, status_code=403)
+    # ... continue with filtered query
+```
+
+### Avoiding Repetition Pattern
+
+Create decorator or wrapper:
+
+```python
+def _with_project_check(required_role: str):
+    """Decorator that checks project access before tool execution."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            project_id = kwargs.get('project') or kwargs.get('project_id')
+            if project_id:
+                err = _require_project_access(project_id, required_role)
+                if err:
+                    return err
+            return await fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# Usage:
+@mcp.tool()
+@_with_project_check('contributor')
+async def create_task(id: str, title: str, project: str = "default", ...):
+    ...
+```
+
+---
+
+## E. Migration Path
+
+### Challenge
+
+Existing tasks have `project` as a free-form string (e.g., `"default"`, `"mrrobot-auth"`). These projects don't exist in the new `projects` table.
+
+### Migration Strategy: Explicit Opt-In
+
+**Option A: Deny-All Until Migrated** (Recommended)
+
+1. Add new tables (`projects`, `project_access`)
+2. Existing tasks with legacy `project` strings become inaccessible until:
+   - Admin creates project in new table
+   - Admin grants access to relevant squads
+3. New code checks `projects` table; if project not found → access denied
+
+**Pros:** Zero ambiguity, no accidental exposure  
+**Cons:** Requires manual migration of existing data
+
+**Option B: Auto-Migrate with Creator as Owner**
+
+1. Add new tables
+2. Run migration script:
+   ```sql
+   -- Create project for each unique project string
+   INSERT INTO projects (id, name, created_by, created_at, updated_at)
+   SELECT DISTINCT 
+       project, 
+       project, 
+       'system', 
+       datetime('now'), 
+       datetime('now')
+   FROM tasks;
+   
+   -- Grant owner access to creator based on activity_log
+   -- (first squad to create a task in each project)
+   INSERT INTO project_access (project_id, squad, role, granted_by, granted_at)
+   SELECT DISTINCT 
+       t.project,
+       COALESCE(a.actor, 'system'),
+       'owner',
+       'system',
+       datetime('now')
+   FROM tasks t
+   LEFT JOIN activity_log a ON t.id = a.task_id AND a.action = 'created'
+   GROUP BY t.project;
+   ```
+3. Flag projects created with `created_by = 'system'` for review
+
+**Pros:** Continuity  
+**Cons:** May guess wrong owner; activity_log may be incomplete
+
+### Recommendation
+
+**Start with Option A** — create explicit admin tool `migrate_legacy_project` that:
+1. Creates project entry
+2. Takes `owners` list parameter
+3. Grants owner access to specified squads
+4. Optionally grants contributor/reader to others
+
+This forces intentional security decisions rather than guessing.
+
+### Default Project Handling
+
+The `default` project is special — many tasks may use it. Options:
+1. **Make `default` open to all authenticated squads** (contributor access)
+2. **Require explicit migration** like other projects
+3. **Deprecate `default` — require explicit project on new tasks**
+
+**Recommendation:** Option 1 for backward compatibility, with log warning when `default` is used.
+
+---
+
+## F. API Surface: New MCP Tools
+
+### Project Management Tools
+
+```python
+@mcp.tool()
+async def create_project(
+    project_id: str,
+    name: str,
+    description: Optional[str] = None,
+) -> str:
+    """Create a new project. Caller becomes the owner.
+    
+    project_id: slug identifier (e.g., 'mrrobot-auth')
+    name: human-readable project name
+    description: optional project description
+    """
+
+@mcp.tool()
+async def get_project(project_id: str) -> str:
+    """Get project details. Requires reader access."""
+
+@mcp.tool()
+def list_projects(
+    role: Optional[str] = None,  # filter: 'owner', 'contributor', 'reader'
+    limit: int = 20,
+) -> str:
+    """List projects accessible to the caller.
+    
+    Returns projects where caller has at least reader access.
+    Optionally filter by minimum role level.
+    """
+
+@mcp.tool()
+async def delete_project(
+    project_id: str,
+    force: bool = False,  # required if project has tasks
+    human_approval: bool = False,
+) -> str:
+    """Delete a project. Requires owner access.
+    
+    If project contains tasks and force=False, returns error.
+    If force=True, deletes project AND all its tasks.
+    """
+```
+
+### Access Control Tools
+
+```python
+@mcp.tool()
+async def grant_project_access(
+    project_id: str,
+    squad: str,
+    role: str,  # 'owner', 'contributor', 'reader'
+) -> str:
+    """Grant a squad access to a project. Requires owner access.
+    
+    If squad already has access, updates their role.
+    Cannot grant higher role than caller has.
+    """
+
+@mcp.tool()
+async def revoke_project_access(
+    project_id: str,
+    squad: str,
+) -> str:
+    """Remove a squad's access to a project. Requires owner access.
+    
+    Cannot revoke if:
+    - squad is the last owner (at least one owner must remain)
+    - caller is revoking their own owner access when they're the last owner
+    """
+
+@mcp.tool()
+def list_project_access(project_id: str) -> str:
+    """List all access grants for a project. Requires owner access.
+    
+    Returns: list of {squad, role, granted_by, granted_at}
+    """
+
+@mcp.tool()
+def who_am_i() -> str:
+    """Return the authenticated squad identity of the caller.
+    
+    Useful for debugging and understanding access context.
+    """
+```
+
+### Migration Tool (Admin)
+
+```python
+@mcp.tool()
+async def migrate_legacy_project(
+    project_id: str,
+    name: str,
+    owners: list[str],
+    contributors: Optional[list[str]] = None,
+    readers: Optional[list[str]] = None,
+) -> str:
+    """(Admin) Migrate a legacy project string to the new access control system.
+    
+    Creates project entry and grants specified access.
+    Only callable by system or admin-designated squad.
+    """
+```
+
+### REST API Additions
+
+```
+POST   /api/v1/projects                         # create_project
+GET    /api/v1/projects                         # list_projects
+GET    /api/v1/projects/:id                     # get_project
+DELETE /api/v1/projects/:id                     # delete_project
+GET    /api/v1/projects/:id/access              # list_project_access
+POST   /api/v1/projects/:id/access              # grant_project_access
+DELETE /api/v1/projects/:id/access/:squad       # revoke_project_access
+GET    /api/v1/whoami                           # who_am_i
+```
+
+---
+
+## G. Security Risks in This Design
+
+### Attack Surface Analysis (Self-Review)
+
+| Attack Vector | Risk | Mitigation |
+|--------------|------|------------|
+| **Race condition: check-then-act** | Squad checks access, then does op; access revoked between | Use transactions; re-verify in same TX |
+| **SQL injection in role param** | If role not validated, injection possible | CHECK constraint + Python validation |
+| **Enumeration via timing** | "project not found" vs "access denied" timing differs | Return same error message and response time |
+| **Privilege escalation via bulk ops** | `create_tasks` could try multiple projects | Per-task project check required |
+| **Default project backdoor** | If default auto-grants, anyone can use it | Explicit warning; recommend disabling |
+| **Token sharing across squads** | Two squads share token = indistinguishable | Out of scope; document as non-goal |
+| **Activity log reveals project names** | Reader can infer other projects from global log | Filter activity_log by project access |
+| **Webhook fire to revoked squad** | Squad registered webhook, later loses access | Re-check access at fire time |
+| **Import injects into multiple projects** | Import file references many projects | Validate each task's project in import |
+| **Search reveals task existence** | FTS returns "1 result in inaccessible project" | Don't reveal count; just filter silently |
+
+### Open Questions for Elliot
+
+1. **Admin override:** Should there be a super-admin that bypasses project ACLs? (For recovery, debugging)
+   - Proposal: `OPM_ADMIN_SQUAD` env var; if set, that squad has implicit owner on all projects
+   
+2. **Cross-project dependencies:** Can task A in project X depend on task B in project Y?
+   - Option A: Yes, if caller has reader on Y (to see dependency status)
+   - Option B: No, dependencies must be intra-project
+   - Recommendation: Option A with access check
+
+3. **Notification integration:** Elliot is designing telemetry/notification. Should notification subscriptions be project-scoped?
+   - Recommendation: Yes — subscriptions inherit project access; only receive events for accessible projects
+
+4. **Default project fate:** Open to all, require migration, or deprecate?
+   - See section E for options
+
+---
+
+## H. Composability with Telemetry/Notifications
+
+Per Elliot's parallel work on telemetry:
+
+1. **Event subscriptions** (`event_subscriptions` table) should respect project access:
+   - If subscription has `project` filter, verify subscriber has reader access
+   - Events should only fire to squads with appropriate project access
+
+2. **Webhook filtering:**
+   - Webhooks already have optional `project` field
+   - Add access check: webhook owner must have reader access to filtered project
+   - When webhook fires, re-verify access (in case revoked since registration)
+
+3. **Team status/events:**
+   - `team_status` and `team_events` are squad-level, not project-level
+   - No changes needed, but could add project context to events
+
+---
+
+## I. Implementation Order
+
+1. **Schema migration** — add `projects` and `project_access` tables
+2. **Core helpers** — `_check_project_access`, `_require_project_access`, `_get_accessible_projects`
+3. **Project management tools** — `create_project`, `list_projects`, etc.
+4. **Access control tools** — `grant_project_access`, `revoke_project_access`
+5. **Retrofit existing tools** — add access checks to all task-touching tools
+6. **REST API updates** — new endpoints + access checks on existing
+7. **Migration tooling** — `migrate_legacy_project` for existing data
+8. **Tests** — access control unit tests, privilege escalation tests
+
+---
+
+## J. Test Plan
+
+### Unit Tests
+
+1. Create project → creator is owner
+2. Grant access → grantee has specified role
+3. Revoke access → grantee loses access
+4. Role hierarchy → owner can do contributor actions
+5. Non-member access → denied
+6. Last owner protection → revoke fails
+
+### Privilege Escalation Tests
+
+1. Reader tries to create task → fails
+2. Contributor tries to grant owner → fails
+3. Non-member lists tasks with project filter → empty result
+4. Non-member gets task by ID → access denied
+5. Bulk create tries multiple projects, one inaccessible → entire batch fails
+6. Webhook owner loses access → webhook stops firing
+
+### Migration Tests
+
+1. Legacy project migration preserves task data
+2. Migrated project has correct access grants
+3. Unmigrated project is inaccessible
+
+---
+
+## Appendix: Quick Reference
+
+### Permission Matrix
+
+| Operation | Owner | Contributor | Reader | None |
+|-----------|:-----:|:-----------:|:------:|:----:|
+| View project metadata | ✓ | ✓ | ✓ | ✗ |
+| List tasks in project | ✓ | ✓ | ✓ | ✗ |
+| Get task details | ✓ | ✓ | ✓ | ✗ |
+| Create task | ✓ | ✓ | ✗ | ✗ |
+| Update task | ✓ | ✓ | ✗ | ✗ |
+| Delete task | ✓ | ✓ | ✗ | ✗ |
+| Grant/revoke access | ✓ | ✗ | ✗ | ✗ |
+| Delete project | ✓ | ✗ | ✗ | ✗ |
+| View access list | ✓ | ✗ | ✗ | ✗ |
+
+### Role Hierarchy
+
+```
+owner (3) → contributor (2) → reader (1) → none (0)
+```
+
+Higher roles inherit all permissions of lower roles.
+
+---
+
+**Next Steps:**
+1. Elliot reviews design for architectural alignment
+2. Cross-check with notification system design
+3. Create implementation tasks in OPM
+4. Begin implementation (schema first)
+
+
+---
+
+## 2026-04-02: Directives
+

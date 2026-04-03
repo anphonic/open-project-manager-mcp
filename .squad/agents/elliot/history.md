@@ -306,3 +306,43 @@ This root cause analysis confirmed the app-level lock contention was the real pr
 - SQLite WAL allows concurrent reads but serializes writes
 - App-level asyncio.Lock is independent — can block even when SQLite is free
 - Symptom analysis: if SELECTs work but INSERTs hang, check app locks first
+
+### 2026-04-03 — Telemetry + Push Notifications Architecture
+
+**Task:** Design per-tenant telemetry and push notification system per Andrew's request.
+
+**Deliverable:** `.squad/decisions/inbox/elliot-telemetry-notifications-design.md`
+
+**Key design decisions:**
+
+1. **Telemetry schema:** `telemetry_metrics` table with hourly buckets (squad, metric_type, project, count, period_start). Bounded growth (24 rows/day per metric), efficient aggregation at query time.
+
+2. **Push notification 3-tier model:**
+   - Tier 1: SSE (real-time for connected clients)
+   - Tier 2: Webhooks (guaranteed delivery, requires HTTP server)
+   - Tier 3: Message queue (persistent, polling-based for offline coordinators)
+
+3. **Client registry:** `sse_clients` table tracks WHO is connected to SSE, not just that connections exist. Changed `_event_bus_clients` from list to dict keyed by client_id with squad metadata.
+
+4. **Scope split:** v0.3.0 gets telemetry + registry + pending notifications. v0.3.1 gets routing logic, pruning, retries.
+
+**Build order:** BO-11 through BO-15 (5 build orders for v0.3.0).
+
+## Learnings
+
+### SSE client identity tracking
+- FastMCP's `_event_bus_clients` is a list of anonymous asyncio.Queues
+- No metadata about which tenant owns which connection
+- Must explicitly track tenant identity in separate data structure (DB + in-memory dict)
+- DB-backed registry survives restart, supports admin queries
+
+### Notification delivery guarantees
+- SSE: instant but ephemeral (must be connected)
+- Webhooks: reliable but requires coordinator to run HTTP server
+- Message queue: persistent but requires polling
+- Hybrid model covers all coordinator deployment scenarios
+
+### Telemetry aggregation strategies
+- Per-event logging (activity_log) is unbounded
+- Hourly buckets provide bounded growth with aggregation flexibility
+- Unique index on (squad, metric, project, period_start) enables efficient upsert
