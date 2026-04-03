@@ -3212,3 +3212,315 @@ Higher roles inherit all permissions of lower roles.
 
 ## 2026-04-02: Directives
 
+
+
+---
+
+## 2026-04-03: P0 Concurrency Bug Fix (Event Loop Blocking)
+
+# P0 Concurrency Bug Fix: Event Loop Blocking
+
+**Author:** Elliot, Lead Architect  
+**Date:** 2025-01-20  
+**Priority:** P0 (blocks v0.3.0 development)  
+**Status:** Pending Review
+
+---
+
+## Root Cause Analysis
+
+### Confirmed Root Cause
+
+**All sqlite3 operations block the asyncio event loop.**
+
+The server uses Python's synchronous `sqlite3` module for ALL database operations (reads AND writes). When any sqlite3 call executes, it blocks the entire event loop thread until completion. This includes:
+
+1. **Write operations** (wrapped in `_locked_write()`): `conn.execute()` + `conn.commit()` 
+2. **Read operations** (NO lock): `conn.execute().fetchall()` / `conn.execute().fetchone()`
+
+### Evidence from Code
+
+**server.py:888-913 — MCP `get_task` tool (sync function, no lock):**
+```python
+@mcp.tool()
+def get_task(task_id: str) -> str:  # <-- NOT async!
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        # ... more conn.execute() calls
+```
+
+**server.py:2001-2007 — REST `GET /tasks` endpoint (async but sync db call):**
+```python
+async def tasks_endpoint(request: Request) -> JSONResponse:
+    # ...
+    rows = conn.execute(  # <-- BLOCKING call inside async function
+        f"SELECT id, title, priority, status, assignee FROM tasks..."
+    ).fetchall()
+```
+
+**server.py:2084-2098 — REST `GET /tasks/{id}` endpoint:**
+```python
+if request.method == "GET":
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()  # BLOCKING
+    task["depends_on"] = [r[0] for r in conn.execute(...).fetchall()]  # BLOCKING
+    task["blocked_by"] = [r[0] for r in conn.execute(...).fetchall()]  # BLOCKING
+```
+
+### Why This Causes Hangs
+
+The hang scenario:
+1. MCP client (SKS) connects via SSE, holding a long-lived HTTP connection
+2. MCP client calls a tool that triggers sqlite3 writes
+3. While sqlite3 executes (even for milliseconds), the event loop is **completely blocked**
+4. HTTP GET requests arriving during this window cannot be processed
+5. If write storms occur (bulk imports, rapid tool calls), the event loop can be blocked for extended periods
+6. `ConnectionTimeoutMiddleware` and request handling cannot run because they're all waiting for the event loop
+
+The `_locked_write()` helper only serializes writes; it does NOT yield to the event loop during sqlite3 calls:
+```python
+async def _locked_write(coro_fn):
+    await asyncio.wait_for(_lock.acquire(), timeout=30.0)  # async wait - good
+    try:
+        return await coro_fn()  # BUT coro_fn() runs sync sqlite3 - blocks!
+    finally:
+        _lock.release()
+```
+
+### `_FixArgumentsMiddleware` Analysis
+
+This middleware does NOT cause blocking. It:
+- Reads the full request body with `await receive()` (async, correct)
+- Patches JSON if needed (pure CPU, fast)
+- Passes to inner app
+
+**NOT the root cause.**
+
+### `ConnectionTimeoutMiddleware` Analysis
+
+This middleware is correctly async. However, it cannot enforce timeouts when the event loop is blocked by sqlite3 calls — the `time.monotonic()` checks never get a chance to run.
+
+**NOT the root cause, but cannot mitigate it either.**
+
+---
+
+## Chosen Fix: `asyncio.to_thread()` for ALL sqlite3 Calls
+
+### Rationale
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **`asyncio.to_thread()`** | Minimal code changes, no new deps, runs sqlite in thread pool | Slight overhead per call |
+| `aiosqlite` | True async interface | New dependency, larger refactor, connection pool semantics differ |
+| Targeted fix | N/A | Root cause is fundamental — all DB ops need fixing |
+
+**Decision:** Use `asyncio.to_thread()` to wrap ALL sqlite3 calls.
+
+This moves blocking operations to the thread pool executor, allowing the event loop to continue processing other requests. The GIL still serializes CPU-bound work, but IO wait (disk reads) and the brief CPU time won't block the event loop.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Create Async Database Helpers
+
+Add new helper functions in `server.py`:
+
+```python
+import asyncio
+from functools import partial
+
+async def _db_execute(query: str, params: tuple = ()) -> list:
+    """Execute a SELECT query and return all rows."""
+    return await asyncio.to_thread(lambda: conn.execute(query, params).fetchall())
+
+async def _db_execute_one(query: str, params: tuple = ()) -> dict | None:
+    """Execute a SELECT query and return one row or None."""
+    return await asyncio.to_thread(lambda: conn.execute(query, params).fetchone())
+
+async def _db_write(fn: callable) -> None:
+    """Execute a write function in the thread pool."""
+    return await asyncio.to_thread(fn)
+```
+
+### Phase 2: Convert MCP Tools to Async
+
+All `@mcp.tool()` decorated functions that access the database must become `async def` and use the new helpers.
+
+**Before:**
+```python
+@mcp.tool()
+def get_task(task_id: str) -> str:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+```
+
+**After:**
+```python
+@mcp.tool()
+async def get_task(task_id: str) -> str:
+    row = await _db_execute_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+```
+
+### Phase 3: Update `_locked_write()` 
+
+The existing lock mechanism is still needed for write serialization, but the actual sqlite3 calls inside must be offloaded:
+
+```python
+async def _locked_write(write_fn):
+    """Acquire lock, run write_fn in thread pool, release."""
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return "Error: write operation timed out waiting for lock"
+    try:
+        return await asyncio.to_thread(write_fn)  # <-- KEY CHANGE
+    finally:
+        _lock.release()
+```
+
+**Important:** `write_fn` must now be a regular function (not async) that contains the sqlite3 calls:
+
+```python
+async def create_task(...) -> str:
+    def _do_write():  # Regular function, not async
+        conn.execute("INSERT INTO tasks ...")
+        _log(id, "created", actor=actor)
+        conn.commit()
+        return None
+    
+    result = await _locked_write(_do_write)
+```
+
+### Phase 4: Update REST API Handlers
+
+REST GET handlers need the same treatment:
+
+```python
+async def tasks_endpoint(request: Request) -> JSONResponse:
+    # ...
+    if request.method == "GET":
+        rows = await _db_execute(
+            f"SELECT id, title, priority, status, assignee FROM tasks"
+            f" {where} ORDER BY {_PRIORITY_CASE}, created_at LIMIT ? OFFSET ?",
+            params + [limit + 1, offset],
+        )
+```
+
+### Files to Modify
+
+1. **`src/open_project_manager_mcp/server.py`**
+   - Add `_db_execute()`, `_db_execute_one()`, `_db_write()` helpers
+   - Update `_locked_write()` to use `asyncio.to_thread()`
+   - Convert all `@mcp.tool()` functions that use sqlite3 to `async def`
+   - Update all REST API handlers to use async helpers
+   - Update all helper functions that do inline sqlite3 reads (e.g., `_verify_bearer()`, `_publish_queue_stats()`)
+
+2. **`src/open_project_manager_mcp/__main__.py`**
+   - No changes required
+
+### Scope of Changes
+
+Approximate count of sqlite3 calls to wrap: **~100 locations**
+
+Key functions requiring conversion:
+- `get_task()` — convert to async
+- `list_tasks()` — convert to async  
+- `search_tasks()` — convert to async
+- `get_project_summary()` — convert to async
+- `get_health()` — convert to async
+- `get_activity_log()` — convert to async
+- `list_webhooks()` — convert to async
+- `list_event_subscriptions()` — convert to async
+- All REST API GET handlers
+- `_verify_bearer()` — becomes async (impacts auth flow)
+- `_publish_queue_stats()` — must be made async-safe
+
+---
+
+## Risks and Caveats
+
+### 1. Thread Safety of sqlite3 Connection
+
+The connection is created with `check_same_thread=False`, which allows multi-threaded access. SQLite's internal locking (with WAL mode and `busy_timeout=5000`) handles concurrent reads.
+
+**Mitigation:** The existing `_lock` ensures write serialization. Reads can safely run concurrently.
+
+### 2. Callback/Event Functions
+
+Functions like `_log()` and `_publish_queue_stats()` are called inside write transactions. They must remain synchronous when called inside `_locked_write()` to avoid nested event loop issues.
+
+**Solution:** Keep these synchronous inside write blocks (they run in the thread pool anyway). Only make standalone calls to them async.
+
+### 3. Auth Flow Changes
+
+`_verify_bearer()` does a sqlite3 read to check tenant_keys. If converted to async, it changes the call signature for `ApiKeyVerifier.verify_token()`.
+
+**Solution:** `ApiKeyVerifier.verify_token()` is already async, so `_verify_bearer()` can become async too.
+
+### 4. Testing
+
+This is a significant refactor. Every MCP tool and REST endpoint must be tested.
+
+**Mitigation:** Existing functional tests should still pass. Add a specific concurrency test that fires requests while a long-running operation is in progress.
+
+---
+
+## Execution Order
+
+**This fix MUST be completed BEFORE any v0.3.0 feature work.**
+
+Reasoning:
+1. The bug causes production outages (SKS/Westworld incident)
+2. Adding more features increases the sqlite3 call surface area
+3. The fix touches core infrastructure that all features depend on
+
+Recommended timeline:
+1. **Day 1:** Implement async helpers, convert `_locked_write()`
+2. **Day 2:** Convert all MCP tool functions to async
+3. **Day 3:** Convert REST API handlers, update auth flow
+4. **Day 4:** Testing, edge case fixes, documentation
+
+---
+
+## Verification Criteria
+
+The fix is successful when:
+
+1. `curl -s GET http://127.0.0.1:8765/api/v1/tasks` returns immediately even while an MCP client is performing write operations
+2. No curl timeout (exit 28) under concurrent load
+3. All existing tests pass
+4. New concurrency stress test passes:
+   ```bash
+   # Start server, connect MCP client, run bulk import
+   # While import runs, fire 100 concurrent GET requests
+   # All GETs should complete in < 1 second
+   ```
+
+---
+
+## Sign-off
+
+- [ ] Elliot (Lead Architect) — Design approved
+- [ ] Darlene (Implementation Lead) — Implementation plan accepted
+- [ ] Dom (QA) — Test plan accepted
+
+---
+
+## Task Tracking
+
+**OPM Server Status:** Not running at time of writing.
+
+When server is available, create task:
+```bash
+curl -s -X POST "http://127.0.0.1:8765/api/v1/tasks" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-token" \
+  -d '{
+    "id": "fix-event-loop-blocking",
+    "title": "P0: Fix event loop blocking (sqlite3 sync calls)",
+    "description": "All sqlite3 operations block the asyncio event loop. This causes HTTP GET requests to hang when MCP clients are performing writes. Solution: wrap ALL sqlite3 calls with asyncio.to_thread(). See .squad/decisions/inbox/elliot-concurrency-fix-design.md for full design.",
+    "project": "opm-v0.3.0",
+    "priority": "critical",
+    "tags": ["P0", "concurrency", "blocking", "infrastructure"]
+  }'
+```
+
