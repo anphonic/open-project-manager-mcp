@@ -1,0 +1,79 @@
+name: Security Scan
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  dependency-audit:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project with all extras and pip-audit
+        # Install all optional extras so every transitive dependency is audited.
+        # Keep this list in sync with the [project.optional-dependencies] table
+        # in pyproject.toml when new extras are added.
+        run: pip install ".[http,webhooks,dev]" "pip-audit==2.8.0"
+
+      - name: Run pip-audit
+        run: pip-audit
+
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
