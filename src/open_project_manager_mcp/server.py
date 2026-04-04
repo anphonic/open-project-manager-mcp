@@ -167,6 +167,52 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
     created_at     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_sub_type_idx ON event_subscriptions(event_type);
+
+CREATE TABLE IF NOT EXISTS telemetry_metrics (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT    NOT NULL,
+    metric_type  TEXT    NOT NULL,
+    metric_name  TEXT    NOT NULL,
+    bucket_hour  TEXT    NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    sum_ms       INTEGER,
+    min_ms       INTEGER,
+    max_ms       INTEGER,
+    error_count  INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL,
+    UNIQUE(tenant_id, metric_type, metric_name, bucket_hour)
+);
+CREATE INDEX IF NOT EXISTS telemetry_tenant_hour_idx ON telemetry_metrics(tenant_id, bucket_hour DESC);
+CREATE INDEX IF NOT EXISTS telemetry_type_idx ON telemetry_metrics(metric_type);
+
+CREATE TABLE IF NOT EXISTS telemetry_daily (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT    NOT NULL,
+    metric_type  TEXT    NOT NULL,
+    metric_name  TEXT    NOT NULL,
+    bucket_date  TEXT    NOT NULL,
+    total_count  INTEGER NOT NULL DEFAULT 0,
+    total_errors INTEGER NOT NULL DEFAULT 0,
+    avg_latency_ms REAL,
+    p95_latency_ms INTEGER,
+    created_at   TEXT    NOT NULL,
+    UNIQUE(tenant_id, metric_type, metric_name, bucket_date)
+);
+CREATE INDEX IF NOT EXISTS telemetry_daily_tenant_idx ON telemetry_daily(tenant_id, bucket_date DESC);
+
+CREATE TABLE IF NOT EXISTS project_permissions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project      TEXT    NOT NULL,
+    tenant_id    TEXT    NOT NULL,
+    role         TEXT    NOT NULL,
+    granted_by   TEXT,
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL,
+    UNIQUE(project, tenant_id)
+);
+CREATE INDEX IF NOT EXISTS perm_project_idx ON project_permissions(project);
+CREATE INDEX IF NOT EXISTS perm_tenant_idx ON project_permissions(tenant_id);
 """
 
 _FTS_SCHEMA = """
@@ -328,6 +374,72 @@ def create_server(
             return getattr(getattr(ctx, "auth", None), "client_id", None) or "system"
         except Exception:
             return "system"
+
+    async def _record_metric(tenant_id: str, metric_type: str, metric_name: str, 
+                             latency_ms: int = None, is_error: bool = False):
+        """Record a telemetry metric. Fire-and-forget — doesn't block caller."""
+        bucket_hour = datetime.now(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        ).isoformat().replace('+00:00', 'Z')
+        now = _now()
+        
+        def _do_write():
+            try:
+                conn.execute("""
+                    INSERT INTO telemetry_metrics 
+                        (tenant_id, metric_type, metric_name, bucket_hour, 
+                         count, sum_ms, min_ms, max_ms, error_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(tenant_id, metric_type, metric_name, bucket_hour) DO UPDATE SET
+                        count = count + 1,
+                        sum_ms = CASE WHEN excluded.sum_ms IS NOT NULL 
+                                 THEN COALESCE(sum_ms, 0) + excluded.sum_ms ELSE sum_ms END,
+                        min_ms = CASE WHEN excluded.min_ms IS NOT NULL 
+                                 THEN MIN(COALESCE(min_ms, excluded.min_ms), excluded.min_ms) ELSE min_ms END,
+                        max_ms = CASE WHEN excluded.max_ms IS NOT NULL 
+                                 THEN MAX(COALESCE(max_ms, 0), excluded.max_ms) ELSE max_ms END,
+                        error_count = error_count + excluded.error_count,
+                        updated_at = excluded.updated_at
+                """, (tenant_id, metric_type, metric_name, bucket_hour, 
+                      latency_ms, latency_ms, latency_ms, 
+                      1 if is_error else 0, now, now))
+                conn.commit()
+            except Exception:
+                pass  # Fire-and-forget — silent failure
+        
+        asyncio.create_task(asyncio.to_thread(_do_write))
+
+    VALID_ROLES = {"owner", "contributor", "reader"}
+    _ROLE_HIERARCHY = {"owner": 3, "contributor": 2, "reader": 1}
+
+    async def _check_project_access(project: str, required_role: str) -> str | None:
+        """
+        Check if current tenant has required_role on project.
+        Returns None if allowed, error string if denied.
+        """
+        # Explicit check for "1" to prevent empty string bypass
+        enforce = os.environ.get("OPM_ENFORCE_PERMISSIONS", "")
+        if enforce != "1":
+            return None  # Enforcement disabled by default
+        
+        tenant_id = _get_actor()
+        if tenant_id == "system":
+            return None  # Unauthenticated mode — allow all
+        
+        row = await _db_execute_one(
+            "SELECT role FROM project_permissions WHERE project = ? AND tenant_id = ?",
+            (project, tenant_id)
+        )
+        if not row:
+            return f"Error: access denied to project '{project}'"
+        
+        role = row["role"]
+        required_level = _ROLE_HIERARCHY.get(required_role, 0)
+        actual_level = _ROLE_HIERARCHY.get(role, 0)
+        
+        if actual_level < required_level:
+            return f"Error: insufficient permissions (have '{role}', need '{required_role}')"
+        return None
 
     # ------------------------------------------------------------------
     # SSE event bus helpers
@@ -699,13 +811,27 @@ def create_server(
         due_date: Optional[str] = None,
     ) -> str:
         """Create a new task. id is a caller-supplied slug (e.g. 'auth-login-ui')."""
+        start_time = time.time()
+        actor = _get_actor()
+        
+        # Permissions check
+        perm_err = await _check_project_access(project, "contributor")
+        if perm_err:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "create_task", latency_ms, is_error=True))
+            return perm_err
+        
         err = _validate_create_params(id, title, description, priority, project, assignee, due_date)
         if err:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "create_task", latency_ms, is_error=True))
             return err
         tags_err = _validate_tags(tags)
         if tags_err:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "create_task", latency_ms, is_error=True))
             return tags_err
-        actor = _get_actor()
+        
         now = _now()
         tags_json = json.dumps(tags) if tags else None
         
@@ -726,6 +852,10 @@ def create_server(
                 return "Error: database error creating task"
         
         result = await _locked_write(_do_write)
+        latency_ms = int((time.time() - start_time) * 1000)
+        is_error = result is not None
+        asyncio.create_task(_record_metric(actor, "tool_call", "create_task", latency_ms, is_error))
+        
         if result:
             return result
         asyncio.create_task(
@@ -756,8 +886,26 @@ def create_server(
         due_date: Optional[str] = None,
     ) -> str:
         """Update fields on an existing task. Only provided fields are changed."""
+        start_time = time.time()
+        actor = _get_actor()
+        
+        # Get task's project for permissions check
+        row = await _db_execute_one("SELECT project FROM tasks WHERE id = ?", (task_id,))
+        if not row:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
+            return f"Error: task '{task_id}' not found"
+        
+        perm_err = await _check_project_access(row["project"], "contributor")
+        if perm_err:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
+            return perm_err
+        
         err = _validate_update_params(title, description, priority, project, status, assignee, due_date)
         if err:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
             return err
         updates: dict[str, object] = {}
         if title is not None:
@@ -775,16 +923,21 @@ def create_server(
         if tags is not None:
             tags_err = _validate_tags(tags)
             if tags_err:
+                latency_ms = int((time.time() - start_time) * 1000)
+                asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
                 return tags_err
             updates["tags"] = json.dumps(tags)
         if due_date is not None:
             updates["due_date"] = due_date
         if not updates:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
             return "Error: no fields to update"
         unknown = set(updates) - _VALID_UPDATE_COLUMNS
         if unknown:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error=True))
             return f"Error: internal error — unknown field(s): {', '.join(sorted(unknown))}"
-        actor = _get_actor()
         
         def _do_write():
             old_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -808,6 +961,10 @@ def create_server(
                 return "Error: database error updating task"
         
         result = await _locked_write(_do_write)
+        latency_ms = int((time.time() - start_time) * 1000)
+        is_error = result is not None
+        asyncio.create_task(_record_metric(actor, "tool_call", "update_task", latency_ms, is_error))
+        
         if result:
             return result
         
@@ -827,6 +984,15 @@ def create_server(
     async def complete_task(task_id: str) -> str:
         """Mark a task as done."""
         actor = _get_actor()
+        
+        # Get task's project for permissions check
+        row = await _db_execute_one("SELECT project FROM tasks WHERE id = ?", (task_id,))
+        if not row:
+            return f"Error: task '{task_id}' not found"
+        
+        perm_err = await _check_project_access(row["project"], "contributor")
+        if perm_err:
+            return perm_err
         
         def _do_write():
             old_row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -860,6 +1026,15 @@ def create_server(
         if not human_approval:
             return "Error: human_approval=True is required to delete a task"
         actor = _get_actor()
+        
+        # Get task's project for permissions check
+        row = await _db_execute_one("SELECT project FROM tasks WHERE id = ?", (task_id,))
+        if not row:
+            return f"Error: task '{task_id}' not found"
+        
+        perm_err = await _check_project_access(row["project"], "owner")
+        if perm_err:
+            return perm_err
         
         def _do_write():
             row = conn.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -895,11 +1070,23 @@ def create_server(
     @mcp.tool()
     async def get_task(task_id: str) -> str:
         """Get a single task by ID, including its dependency info."""
+        start_time = time.time()
+        actor = _get_actor()
+        
         try:
             row = await _db_execute_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
             if row is None:
+                latency_ms = int((time.time() - start_time) * 1000)
+                asyncio.create_task(_record_metric(actor, "tool_call", "get_task", latency_ms, is_error=True))
                 return f"Error: task '{task_id}' not found"
+            
             task = _row(row)
+            perm_err = await _check_project_access(task["project"], "reader")
+            if perm_err:
+                latency_ms = int((time.time() - start_time) * 1000)
+                asyncio.create_task(_record_metric(actor, "tool_call", "get_task", latency_ms, is_error=True))
+                return perm_err
+            
             depends_on_rows = await _db_execute(
                 "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
             )
@@ -911,8 +1098,13 @@ def create_server(
                 (task_id,),
             )
             task["blocked_by"] = [r[0] for r in blocked_by_rows]
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "get_task", latency_ms, is_error=False))
             return json.dumps(task)
         except sqlite3.Error:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "get_task", latency_ms, is_error=True))
             return "Error: database error reading task"
 
     @mcp.tool()
@@ -927,6 +1119,16 @@ def create_server(
         """List tasks with optional filters. Returns compact rows: id, title, priority, status, assignee.
         Sorted by priority (critical first), then created_at. Supports pagination via limit/offset.
         Use get_task(task_id) to fetch full details for a specific task."""
+        start_time = time.time()
+        actor = _get_actor()
+        
+        if project:
+            perm_err = await _check_project_access(project, "reader")
+            if perm_err:
+                latency_ms = int((time.time() - start_time) * 1000)
+                asyncio.create_task(_record_metric(actor, "tool_call", "list_tasks", latency_ms, is_error=True))
+                return perm_err
+        
         limit = max(1, min(limit, _MAX_LIMIT))
         conditions, params = [], []
         if project:
@@ -948,14 +1150,20 @@ def create_server(
                 f" {where} ORDER BY {_PRIORITY_CASE}, created_at LIMIT ? OFFSET ?",
                 tuple(params + [limit + 1, offset]),
             )
+            has_more = len(rows) > limit
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "list_tasks", latency_ms, is_error=False))
+            
+            return json.dumps({
+                "tasks": [dict(r) for r in rows[:limit]],
+                "has_more": has_more,
+                "offset": offset,
+            })
         except sqlite3.Error:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "list_tasks", latency_ms, is_error=True))
             return "Error: database error listing tasks"
-        has_more = len(rows) > limit
-        return json.dumps({
-            "tasks": [dict(r) for r in rows[:limit]],
-            "has_more": has_more,
-            "offset": offset,
-        })
 
     # ------------------------------------------------------------------
     # Dependencies
@@ -1418,9 +1626,23 @@ def create_server(
         limit: int = 20,
     ) -> str:
         """Full-text search across task title, description, and tags. Ranked by relevance."""
+        start_time = time.time()
+        actor = _get_actor()
+        
+        if project:
+            perm_err = await _check_project_access(project, "reader")
+            if perm_err:
+                latency_ms = int((time.time() - start_time) * 1000)
+                asyncio.create_task(_record_metric(actor, "tool_call", "search_tasks", latency_ms, is_error=True))
+                return perm_err
+        
         if not _fts_available:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "search_tasks", latency_ms, is_error=True))
             return "Error: full-text search is not available (FTS5 not compiled into SQLite)"
         if len(query) > _MAX_SHORT_FIELD:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "search_tasks", latency_ms, is_error=True))
             return f"Error: 'query' exceeds maximum length of {_MAX_SHORT_FIELD} characters"
         limit = max(1, min(limit, _MAX_LIMIT))
         conditions: list[str] = []
@@ -1442,13 +1664,19 @@ def create_server(
                 f" ORDER BY rank LIMIT ?",
                 tuple(params + [limit + 1]),
             )
+            has_more = len(rows) > limit
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "search_tasks", latency_ms, is_error=False))
+            
+            return json.dumps({
+                "tasks": [dict(r) for r in rows[:limit]],
+                "has_more": has_more,
+            })
         except sqlite3.Error:
+            latency_ms = int((time.time() - start_time) * 1000)
+            asyncio.create_task(_record_metric(actor, "tool_call", "search_tasks", latency_ms, is_error=True))
             return "Error: search failed — invalid query syntax"
-        has_more = len(rows) > limit
-        return json.dumps({
-            "tasks": [dict(r) for r in rows[:limit]],
-            "has_more": has_more,
-        })
 
     # ------------------------------------------------------------------
     # Feature 3: Bulk operations
@@ -1907,6 +2135,321 @@ def create_server(
         if result:
             return result
         return json.dumps({"id": id, "deleted": True})
+
+    # ------------------------------------------------------------------
+    # Feature 7: Telemetry Tools
+    # ------------------------------------------------------------------
+
+    _MAX_TELEMETRY_HOURS = 720  # 30 days max lookback to prevent DoS
+
+    @mcp.tool()
+    async def get_telemetry_summary(hours: int = 24) -> str:
+        """Get aggregated telemetry for calling tenant over last N hours (max 720)."""
+        hours = max(1, min(hours, _MAX_TELEMETRY_HOURS))
+        actor = _get_actor()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            rows = await _db_execute("""
+                SELECT metric_type, metric_name, 
+                       SUM(count) as total_calls,
+                       SUM(error_count) as total_errors,
+                       ROUND(SUM(sum_ms) * 1.0 / SUM(count), 2) as avg_latency_ms
+                FROM telemetry_metrics
+                WHERE tenant_id = ? AND bucket_hour >= ?
+                GROUP BY metric_type, metric_name
+                ORDER BY total_calls DESC
+            """, (actor, cutoff))
+            return json.dumps({"hours": hours, "metrics": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error querying telemetry"
+
+    @mcp.tool()
+    async def get_telemetry_by_tool(tool_name: str, hours: int = 24) -> str:
+        """Get detailed metrics for a specific tool (max 720 hours)."""
+        hours = max(1, min(hours, _MAX_TELEMETRY_HOURS))
+        actor = _get_actor()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            rows = await _db_execute("""
+                SELECT bucket_hour, count, error_count, 
+                       ROUND(sum_ms * 1.0 / count, 2) as avg_latency_ms,
+                       min_ms, max_ms
+                FROM telemetry_metrics
+                WHERE tenant_id = ? AND metric_name = ? AND bucket_hour >= ?
+                ORDER BY bucket_hour DESC
+            """, (actor, tool_name, cutoff))
+            return json.dumps({"tool": tool_name, "hours": hours, "buckets": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error querying telemetry"
+
+    @mcp.tool()
+    async def list_top_tools(limit: int = 10, hours: int = 24) -> str:
+        """List most-called tools for calling tenant (max 720 hours, 100 limit)."""
+        hours = max(1, min(hours, _MAX_TELEMETRY_HOURS))
+        actor = _get_actor()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            rows = await _db_execute("""
+                SELECT metric_name, SUM(count) as total_calls
+                FROM telemetry_metrics
+                WHERE tenant_id = ? AND metric_type = 'tool_call' AND bucket_hour >= ?
+                GROUP BY metric_name
+                ORDER BY total_calls DESC
+                LIMIT ?
+            """, (actor, cutoff, min(limit, 100)))
+            return json.dumps({"hours": hours, "top_tools": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error querying telemetry"
+
+    @mcp.tool()
+    async def get_error_summary(hours: int = 24) -> str:
+        """Get error counts by tool for calling tenant (max 720 hours)."""
+        hours = max(1, min(hours, _MAX_TELEMETRY_HOURS))
+        actor = _get_actor()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            rows = await _db_execute("""
+                SELECT metric_name, SUM(error_count) as total_errors, SUM(count) as total_calls
+                FROM telemetry_metrics
+                WHERE tenant_id = ? AND bucket_hour >= ? AND error_count > 0
+                GROUP BY metric_name
+                ORDER BY total_errors DESC
+            """, (actor, cutoff))
+            return json.dumps({"hours": hours, "errors": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error querying telemetry"
+
+    # ------------------------------------------------------------------
+    # Feature 8: Permissions Tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def grant_project_access(
+        project: str, 
+        target_tenant_id: str, 
+        role: str,
+        human_approval: bool = False
+    ) -> str:
+        """Grant a tenant access to a project. Requires owner role."""
+        if not human_approval:
+            return "Error: human_approval=True required for grant_project_access"
+        if role not in VALID_ROLES:
+            return f"Error: invalid role '{role}' (must be owner/contributor/reader)"
+        
+        perm_err = await _check_project_access(project, "owner")
+        if perm_err:
+            return perm_err
+        
+        actor = _get_actor()
+        now = _now()
+        
+        def _do_write():
+            try:
+                conn.execute("""
+                    INSERT INTO project_permissions (project, tenant_id, role, granted_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project, tenant_id) DO UPDATE SET
+                        role = excluded.role,
+                        granted_by = excluded.granted_by,
+                        updated_at = excluded.updated_at
+                """, (project, target_tenant_id, role, actor, now, now))
+                conn.commit()
+                return None
+            except sqlite3.Error:
+                return "Error: database error granting access"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
+        return json.dumps({"project": project, "tenant_id": target_tenant_id, "role": role, "granted_by": actor})
+
+    @mcp.tool()
+    async def revoke_project_access(
+        project: str, 
+        target_tenant_id: str,
+        human_approval: bool = False
+    ) -> str:
+        """Revoke a tenant's access to a project. Requires owner role."""
+        if not human_approval:
+            return "Error: human_approval=True required for revoke_project_access"
+        
+        perm_err = await _check_project_access(project, "owner")
+        if perm_err:
+            return perm_err
+        
+        actor = _get_actor()
+        if target_tenant_id == actor:
+            return "Error: cannot revoke your own access (use transfer_project_ownership)"
+        
+        def _do_write():
+            cur = conn.execute(
+                "DELETE FROM project_permissions WHERE project = ? AND tenant_id = ?",
+                (project, target_tenant_id)
+            )
+            conn.commit()
+            return cur.rowcount
+        
+        rows = await _locked_write(_do_write)
+        if rows == 0:
+            return f"Error: no access entry found for '{target_tenant_id}' on '{project}'"
+        return json.dumps({"revoked": True, "project": project, "tenant_id": target_tenant_id})
+
+    @mcp.tool()
+    async def list_project_permissions(project: str) -> str:
+        """List all members with access to a project."""
+        perm_err = await _check_project_access(project, "reader")
+        if perm_err:
+            return perm_err
+        
+        try:
+            rows = await _db_execute("""
+                SELECT tenant_id, role, granted_by, created_at
+                FROM project_permissions
+                WHERE project = ?
+                ORDER BY 
+                    CASE role WHEN 'owner' THEN 0 WHEN 'contributor' THEN 1 ELSE 2 END,
+                    created_at
+            """, (project,))
+            return json.dumps({"project": project, "members": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error listing permissions"
+
+    @mcp.tool()
+    async def get_my_permissions() -> str:
+        """List all projects the calling tenant has access to."""
+        actor = _get_actor()
+        try:
+            rows = await _db_execute("""
+                SELECT project, role, created_at
+                FROM project_permissions
+                WHERE tenant_id = ?
+                ORDER BY project
+            """, (actor,))
+            return json.dumps({"tenant_id": actor, "projects": [dict(r) for r in rows]})
+        except sqlite3.Error:
+            return "Error: database error querying permissions"
+
+    @mcp.tool()
+    async def transfer_project_ownership(
+        project: str,
+        new_owner_tenant_id: str,
+        human_approval: bool = False
+    ) -> str:
+        """Transfer project ownership to another tenant. Current owner becomes contributor."""
+        if not human_approval:
+            return "Error: human_approval=True required for transfer_project_ownership"
+        
+        perm_err = await _check_project_access(project, "owner")
+        if perm_err:
+            return perm_err
+        
+        actor = _get_actor()
+        now = _now()
+        
+        def _do_write():
+            try:
+                # Make new tenant owner
+                conn.execute("""
+                    INSERT INTO project_permissions (project, tenant_id, role, granted_by, created_at, updated_at)
+                    VALUES (?, ?, 'owner', ?, ?, ?)
+                    ON CONFLICT(project, tenant_id) DO UPDATE SET
+                        role = 'owner',
+                        granted_by = excluded.granted_by,
+                        updated_at = excluded.updated_at
+                """, (project, new_owner_tenant_id, actor, now, now))
+                # Demote current owner to contributor
+                conn.execute("""
+                    UPDATE project_permissions SET role = 'contributor', updated_at = ?
+                    WHERE project = ? AND tenant_id = ? AND role = 'owner'
+                """, (now, project, actor))
+                conn.commit()
+                return None
+            except sqlite3.Error:
+                return "Error: database error transferring ownership"
+        
+        result = await _locked_write(_do_write)
+        if result:
+            return result
+        return json.dumps({
+            "transferred": True, 
+            "project": project, 
+            "new_owner": new_owner_tenant_id,
+            "previous_owner": actor,
+            "previous_owner_new_role": "contributor"
+        })
+
+    @mcp.tool()
+    async def get_project_access(project: str, target_tenant_id: str) -> str:
+        """Check a specific tenant's access to a project."""
+        perm_err = await _check_project_access(project, "reader")
+        if perm_err:
+            return perm_err
+        
+        try:
+            row = await _db_execute_one(
+                "SELECT role, granted_by, created_at FROM project_permissions WHERE project = ? AND tenant_id = ?",
+                (project, target_tenant_id)
+            )
+            if not row:
+                return json.dumps({"project": project, "tenant_id": target_tenant_id, "access": None})
+            return json.dumps({"project": project, "tenant_id": target_tenant_id, "access": dict(row)})
+        except sqlite3.Error:
+            return "Error: database error querying access"
+
+    @mcp.tool()
+    async def migrate_permissions(human_approval: bool = False) -> str:
+        """Admin: Backfill permissions for existing projects. Makes each tenant owner of their projects."""
+        if not human_approval:
+            return "Error: human_approval=True required for migrate_permissions"
+        
+        actor = _get_actor()
+        now = _now()
+        
+        try:
+            rows = await _db_execute("""
+                SELECT DISTINCT t.project, al.actor
+                FROM tasks t
+                JOIN activity_log al ON al.task_id = t.id AND al.action = 'created'
+                WHERE al.actor != 'system'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM project_permissions pp 
+                      WHERE pp.project = t.project AND pp.tenant_id = al.actor
+                  )
+            """, ())
+        except sqlite3.Error:
+            return "Error: database error querying tasks"
+        
+        count = 0
+        def _do_write():
+            nonlocal count
+            for row in rows:
+                conn.execute("""
+                    INSERT OR IGNORE INTO project_permissions 
+                        (project, tenant_id, role, granted_by, created_at, updated_at)
+                    VALUES (?, ?, 'owner', 'migration', ?, ?)
+                """, (row["project"], row["actor"], now, now))
+                count += 1
+            conn.commit()
+            return None
+        
+        await _locked_write(_do_write)
+        return json.dumps({"migrated": count, "message": f"Granted owner role on {count} project-tenant pairs"})
+
+    @mcp.tool()
+    async def set_permission_enforcement(enabled: bool, human_approval: bool = False) -> str:
+        """Admin: Toggle permission enforcement. WARNING: affects all operations."""
+        if not human_approval:
+            return "Error: human_approval=True required for set_permission_enforcement"
+        
+        if enabled:
+            os.environ["OPM_ENFORCE_PERMISSIONS"] = "1"
+        else:
+            os.environ.pop("OPM_ENFORCE_PERMISSIONS", None)
+        
+        return json.dumps({
+            "enforcement_enabled": enabled,
+            "note": "Runtime change — set OPM_ENFORCE_PERMISSIONS=1 for persistent enforcement"
+        })
 
     # ------------------------------------------------------------------
     # Feature 6: REST API
@@ -2656,6 +3199,60 @@ def create_server(
                     return JSONResponse({"id": sub_id, "deleted": True})
                 return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
+            async def telemetry_summary_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                try:
+                    hours = int(request.query_params.get("hours", 24))
+                except ValueError:
+                    return JSONResponse({"error": "Invalid hours parameter"}, status_code=400)
+                result = await get_telemetry_summary(hours)
+                if result.startswith("Error:"):
+                    return JSONResponse({"error": result}, status_code=500)
+                return JSONResponse(json.loads(result))
+
+            async def telemetry_tool_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                tool_name = request.path_params["tool_name"]
+                try:
+                    hours = int(request.query_params.get("hours", 24))
+                except ValueError:
+                    return JSONResponse({"error": "Invalid hours parameter"}, status_code=400)
+                result = await get_telemetry_by_tool(tool_name, hours)
+                if result.startswith("Error:"):
+                    return JSONResponse({"error": result}, status_code=500)
+                return JSONResponse(json.loads(result))
+
+            async def telemetry_top_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                try:
+                    limit = int(request.query_params.get("limit", 10))
+                    hours = int(request.query_params.get("hours", 24))
+                except ValueError:
+                    return JSONResponse({"error": "Invalid limit or hours parameter"}, status_code=400)
+                result = await list_top_tools(limit, hours)
+                if result.startswith("Error:"):
+                    return JSONResponse({"error": result}, status_code=500)
+                return JSONResponse(json.loads(result))
+
+            async def telemetry_errors_endpoint(request: Request) -> JSONResponse:
+                actor, err = await _check_auth(request)
+                if err:
+                    return err
+                try:
+                    hours = int(request.query_params.get("hours", 24))
+                except ValueError:
+                    return JSONResponse({"error": "Invalid hours parameter"}, status_code=400)
+                result = await get_error_summary(hours)
+                if result.startswith("Error:"):
+                    return JSONResponse({"error": result}, status_code=500)
+                return JSONResponse(json.loads(result))
+
             return Router(routes=[
                 Route("/tasks", endpoint=tasks_endpoint, methods=["GET", "POST"]),
                 Route("/tasks/{id:str}", endpoint=task_endpoint, methods=["GET", "PATCH", "DELETE"]),
@@ -2671,6 +3268,10 @@ def create_server(
                 Route("/subscriptions/{id:str}", endpoint=subscription_endpoint, methods=["GET", "DELETE"]),
                 Route("/register", endpoint=register_endpoint, methods=["POST"]),
                 Route("/register/{squad:str}", endpoint=deregister_endpoint, methods=["DELETE"]),
+                Route("/telemetry/summary", endpoint=telemetry_summary_endpoint, methods=["GET"]),
+                Route("/telemetry/tools/{tool_name:str}", endpoint=telemetry_tool_endpoint, methods=["GET"]),
+                Route("/telemetry/top", endpoint=telemetry_top_endpoint, methods=["GET"]),
+                Route("/telemetry/errors", endpoint=telemetry_errors_endpoint, methods=["GET"]),
             ])
 
         mcp._rest_router = _build_rest_router()
