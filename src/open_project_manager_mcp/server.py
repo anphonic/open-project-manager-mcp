@@ -72,7 +72,7 @@ class ApiKeyVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            tenant_id = self._verify(token)
+            tenant_id = await self._verify(token)
             if not tenant_id:
                 raise AuthenticationError("Invalid API key")
             return AccessToken(
