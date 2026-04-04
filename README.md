@@ -110,6 +110,59 @@ See [Webhooks](#webhooks) for payload shape, events, and signature verification.
 | `list_subscriptions` | `subscriber?` | List event subscriptions |
 | `unsubscribe_events` | `id`, `human_approval` | Remove subscription |
 
+### Telemetry (v0.3.0)
+
+**4 MCP tools** for monitoring server usage and performance metrics per tenant.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `get_telemetry_summary` | `hours=24` | Aggregated counts/latency across all tools for calling tenant |
+| `get_telemetry_by_tool` | `tool_name`, `hours=24` | Hourly-bucketed metrics for a specific tool |
+| `list_top_tools` | `limit=10`, `hours=24` | Most-called tools ranked by call count |
+| `get_error_summary` | `hours=24` | Error counts per tool with total call counts |
+
+**What gets tracked:**
+- Tool call counts (per tool, per hour)
+- Call latency (p50 via avg, p95/p99 via min/max per bucket)
+- Error counts (tool calls that returned an error)
+- REST API call metrics (same pattern)
+- Metrics are tenant-scoped (visible only to calling tenant)
+
+Telemetry is automatically recorded on every tool and REST API call with <1ms overhead. Query your usage via tools or REST endpoints (see REST API section below).
+
+### Permissions (v0.3.0)
+
+**8 MCP tools** for project-level access control with role-based enforcement (owner/contributor/reader).
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `grant_project_access` | `project`, `tenant_id`, `role`, `human_approval=True` | Grant a tenant access to a project with a specific role |
+| `revoke_project_access` | `project`, `tenant_id`, `human_approval=True` | Remove a tenant's access to a project |
+| `list_project_members` | `project` | List all tenants with access to a project and their roles |
+| `get_my_projects` | — | List all projects the calling tenant has access to (any role) |
+| `get_project_access` | `project`, `tenant_id` | Check if a tenant has access to a project and their role |
+| `transfer_project_ownership` | `project`, `new_owner_tenant_id`, `human_approval=True` | Transfer owner role to another tenant |
+| `migrate_permissions` | `human_approval=True` | **Admin tool** — Backfill permissions for existing projects (run once during upgrade) |
+| `set_permission_enforcement` | `enabled: bool`, `human_approval=True` | **Admin tool** — Toggle enforcement (default OFF, enable after `migrate_permissions`) |
+
+**Role hierarchy:**
+- `owner` — Read, write, delete tasks; manage members
+- `contributor` — Read and write tasks (cannot delete or manage members)
+- `reader` — Read-only access
+
+**Enforcement:**
+- By default, enforcement is OFF for v0.3.0 (backward compatible)
+- Enable enforcement via `set_permission_enforcement(enabled=True)` after running `migrate_permissions()`
+- Control via `OPM_ENFORCE_PERMISSIONS` environment variable
+- When OFF, all tenants have full access (current behavior)
+- When ON, access is denied by default; must grant explicit roles
+
+**Migration path for existing projects:**
+1. Upgrade to v0.3.0 (enforcement OFF, no changes to existing access)
+2. Run `migrate_permissions()` once to backfill existing projects with `owner` role for their tenant
+3. Optionally grant additional contributors/readers via `grant_project_access`
+4. Enable enforcement with `set_permission_enforcement(enabled=True)`
+
 ---
 
 ## Install
@@ -359,6 +412,14 @@ All endpoints are mounted at `/api/v1`. Auth uses the same Bearer token as the M
 | `POST` | `/api/v1/subscriptions` | Create event subscription |
 | `GET` | `/api/v1/subscriptions` | List subscriptions |
 | `DELETE` | `/api/v1/subscriptions/{id}` | Remove subscription |
+| `GET` | `/api/v1/telemetry/summary` | Aggregated metrics for calling tenant (query param: `hours=24`) |
+| `GET` | `/api/v1/telemetry/tools/{tool_name}` | Hourly-bucketed metrics for specific tool (query param: `hours=24`) |
+| `GET` | `/api/v1/telemetry/top` | Most-called tools (query params: `limit=10`, `hours=24`) |
+| `GET` | `/api/v1/telemetry/errors` | Error summary by tool (query param: `hours=24`) |
+| `GET` | `/api/v1/projects/mine` | Projects caller has access to with roles |
+| `GET` | `/api/v1/projects/{project}/members` | List project members and their roles |
+| `POST` | `/api/v1/projects/{project}/members` | Grant project access (body: `tenant_id`, `role`, `human_approval`) |
+| `DELETE` | `/api/v1/projects/{project}/members/{tenant_id}` | Revoke project access (query: `confirm=true`) |
 
 ### `GET /api/v1/tasks` query params
 

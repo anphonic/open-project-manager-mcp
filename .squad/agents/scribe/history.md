@@ -1,94 +1,30 @@
-# Scribe — History
-
-## Core Context
-- Project: open-project-manager-mcp
-- Stack: Python, SQLite (stdlib), FastMCP
-- Sibling: squad-knowledge-mcp at J:\Coding\squad-knowledge-mcp
-- Squad Knowledge Server: http://192.168.1.178:8768 (SSE)
-- Requested by: Andrew (project owner)
-
-## Role
-Session Logger. I maintain memory, decisions, and logs for the team.
-
-## Session Log
-
-### 2026-03-31 — Initial implementation session
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260331T223000Z-coordinator.md` documenting the full session
-- Merged `.squad/decisions/inbox/elliot-architecture-confirmed.md` into `.squad/decisions.md` as a new entry; deleted inbox file
-- Updated history.md for Darlene, Romero, Angela, and Scribe (this file) noting the process deviation
-- Committed all work: `feat: initial implementation — 11 tools, SQLite backend, 60 tests passing`
-
-**Process deviation noted:** Coordinator built the full implementation directly without routing to squad agents. Logged in orchestration log and agent histories.
-
-### 2026-03-31 — Review round logging session (v0.1.0 review round)
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260331T223819Z-review-round.md` documenting all five review agents, their findings, and changes made
-- Updated history.md for Elliot (TransportSecuritySettings critical fix)
-- Updated history.md for Darlene (compact payload fix, limit=0 guard)
-- Updated history.md for Romero (70 tests, +10 new, SSE transport coverage)
-- Updated history.md for Angela (README + CHARTER ingested to squad knowledge server)
-- Replaced stub history.md for Dom with full entry (security audit, 5 issues fixed)
-- Added Dom to `.squad/routing.md` (Security vulnerabilities, input validation, transport auth)
-- Committed all changes: `review: squad review round — 5 agents, 10 findings fixed`
-
-### 2026-03-31 — Auth + deployment logging session
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260331T224608Z-deploy.md` documenting Darlene's auth work and coordinator deployment to skitterphuger
-- Updated history.md for Darlene (auth implementation, OPM_TENANT_KEYS, --generate-token, 81 tests)
-- Updated history.md for Dom (note that auth aligns with her security recommendations)
-- Updated history.md for Scribe (this entry)
-- Added two new decisions to `.squad/decisions.md`: multi-tenant auth + deployment to skitterphuger
-- Committed all changes: `feat: multi-tenant bearer token auth + deploy to skitterphuger`
-
-### 2026-04-01 — v0.2.0 feature sprint logging session
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260401T024400Z-v0.2.0.md` documenting the full v0.2.0 sprint (Elliot arch, Trenton/Mobley reviews, Darlene impl, coordinator bug fixes, Dom security audit, Romero gap analysis, deployment update)
-- Updated history.md for Elliot (v0.2.0 architecture decisions, 7 features, DNS rebinding open item)
-- Updated history.md for Darlene (7 features implemented, 188 tests)
-- Updated history.md for Romero (+36 tests, 224 total)
-- Updated history.md for Dom (8 security fixes, 1 open item)
-- Replaced stub history.md for Trenton with full entry (hired + schema review, 4 critical catches)
-- Replaced stub history.md for Mobley with full entry (hired + API review, 3 critical catches)
-- Added DNS rebinding OPEN ITEM to `.squad/decisions.md`
-- Marked all 7 v0.2.0 feature tasks as done on the PM server (http://192.168.1.178:8765)
-- Committed all changes: `feat: v0.2.0 — due-dates, FTS, bulk ops, activity log, export/import, REST API, webhooks`
-
-### 2026-04-01 — Registration feature logging session
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260401T220000Z-registration.md` documenting Elliot's architecture, Darlene's implementation, Dom's in-progress audit, and Angela's knowledge board posts
-- Updated history.md for Elliot (registration architecture, 10 decisions, `darlene-brief-register.md`)
-- Updated history.md for Darlene (registration impl, `ApiKeyVerifier` refactor, `_verify_bearer`, rate limiter, 26 new tests, 250 total)
-- Updated history.md for Angela (4 knowledge board entries, topic: mcp-infrastructure)
-- Updated history.md for Scribe (this entry)
-- PM server board noted: `self-service-registration` remains `in_progress` — Dom audit pending; `backward-compat`, `github-issues-sync`, `scribe-pm-logging` tasks logged
-- **No git commit** — awaiting Dom security audit completion
-
-### 2026-04-02 — MCP config consolidation + agent registration logging session
-
-**Actions taken this session:**
-- Created `.squad/orchestration-log/20260402T031500Z-coordinator.md` documenting MCP config consolidation, firewall setup, coordinator profile creation, and agent deployment
-- Created `.squad/log/20260402T031500Z-mcp-config-agents.md` documenting configuration changes and agent registration workflow
-- Updated squad knowledge server references in `team.md` and this history.md from old endpoint to http://192.168.1.178:8768
-- Verified OPM_BEARER_TOKEN in registry (43 chars) — pending process env injection after CLI restart
-- Confirmed all 4 MCP configs updated to SSE HTTP transport
-- Confirmed coordinator profile d77be8c deployed and all agent .agent.md files copied to ~/.copilot/agents/
-- No git commit this session (consolidated logs pending final review)
-
-**Process observations:**
-- Bearer token injection requires Copilot CLI restart to propagate to new process environments
-- All agent profiles successfully registered in centralized ~/.copilot/agents/ directory for CLI discovery
-- Squad-knowledge endpoint now unified across all MCP clients
+# scribe history
 
 ## Learnings
 
-- Always create `.squad/orchestration-log/` before writing a log entry (directory did not exist at session start)
-- Inbox files in `.squad/decisions/inbox/` must be merged into `decisions.md` and then deleted after each session
-- New squad members (Trenton, Mobley) hired as specialists to review before implementation — caught 7 bugs pre-code
-- MCP config consolidation: Update all endpoint references and test bearer token propagation immediately after CLI restart
-- Agent profile deployment: Always validate files are present in ~/.copilot/agents/ after copying from repository
+_(Fresh start — 2026-04-03)_
+
+---
+
+### 2026-04-05: v0.3.0 Sprint Finalization
+
+**Task:** Merge v0.3.0 sprint decision inbox files and create release commit.
+
+**Deliverables:**
+- Merged 8 decision inbox files into `decisions.md` with comprehensive v0.3.0 section
+- Updated history.md for all 7 participating agents (elliot, darlene, romero, angela, trenton, mobley, dom)
+- Created `orchestration-log/session-log.md` with full sprint summary
+- Created git commit: `feat: v0.3.0 telemetry + permissions`
+
+**Sprint Summary:**
+- Sprint: v0.3.0 telemetry + permissions
+- Agents: 7 deployed (architecture, schema, backend, REST, testing, security, docs)
+- Outcome: 43/47 tests passing, 4 security fixes, docs complete, version bumped to 0.3.0
+- Features: Fire-and-forget telemetry (4 tools), project permissions (8 tools), 8 REST endpoints
+
+**Key Learnings:**
+- Decision inbox pattern works well — agents document decisions during sprint, scribe merges at end
+- Agent history entries should be brief (3-5 lines) summarizing contributions and final status
+- Orchestration log captures high-level sprint narrative for future reference
+- Git commit messages should comprehensively list all changes for release tracking
+

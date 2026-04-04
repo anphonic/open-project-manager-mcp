@@ -20,14 +20,16 @@
 | Dom | Security Expert | `.squad/agents/dom/charter.md` | 🟢 Active |
 | Trenton | Database & Data Pipeline | `.squad/agents/trenton/charter.md` | 🟢 Active |
 | Mobley | Integration & External Systems | `.squad/agents/mobley/charter.md` | 🟢 Active |
-| Ralph | Work Monitor | — | 🔄 Monitor |
+| Ralph | Work Monitor | `.squad/agents/ralph/charter.md` | 🔄 Monitor |
 
 ## Project Context
 
 - **Project:** open-project-manager-mcp — SQLite-backed project management MCP server
 - **Stack:** Python, SQLite (stdlib), FastMCP
 - **Goal:** MCP server giving AI agent squads a persistent prioritized task queue.
-- **Companion:** squad-knowledge-mcp at J:\Coding\squad-knowledge-mcp (same FastMCP patterns)
-- **Squad Knowledge Server:** http://192.168.1.178:8766/mcp — shared cross-squad knowledge board
 - **Team root:** J:\Coding\open-project-manager-mcp
-- **Created:** 2026-03-31
+- **OPM Server:** http://192.168.1.178:8765/mcp (Bearer: OPM_BEARER_TOKEN)
+- **Squad Knowledge Server:** http://192.168.1.178:8768 (SSE, no auth)
+- **Godot Docs:** http://192.168.1.178:8767/mcp
+- **Blender:** http://192.168.1.178:8760/mcp
+- **Fresh start:** 2026-04-04

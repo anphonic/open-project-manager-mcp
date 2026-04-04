@@ -21,7 +21,7 @@ with patch("open_project_manager_mcp.server.sqlite3") as mock_sqlite:
 ```
 
 ## Squad Knowledge Server
-Query http://192.168.1.178:8766/mcp for testing patterns:
+Query http://192.168.1.178:8768/mcp for testing patterns:
 - search_squad_knowledge(project="squad-knowledge-mcp", query="test mocking pattern tool manager")
 - Check board for open questions from Darlene about server structure
 

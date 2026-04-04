@@ -221,6 +221,10 @@ class TestWriteLockTimeout:
     def test_lock_timeout_error_message_format(self, mcp_server):
         """Verify timeout error message is helpful."""
         async def run_test():
+            # First create a valid task to update
+            create_task_fn = _get_tool(mcp_server, "create_task")
+            await create_task_fn(id="msg-test", title="Message test task")
+            
             lock = _get_lock_from_server(mcp_server)
             await lock.acquire()
             
@@ -232,7 +236,7 @@ class TestWriteLockTimeout:
                 
                 with patch('asyncio.wait_for', side_effect=short_timeout_wait_for):
                     update_task_fn = _get_tool(mcp_server, "update_task")
-                    result = await update_task_fn(task_id="nonexistent", title="New Title")
+                    result = await update_task_fn(task_id="msg-test", title="New Title")
                     
                     # Verify error message is informative
                     assert "Error" in result

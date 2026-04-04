@@ -20,7 +20,7 @@ where a misconfigured webhook fires into the void. You build things that stay co
 - Error response consistency — same shape across MCP tools and REST endpoints
 
 ## Squad Knowledge Server
-Query http://192.168.1.178:8766/mcp for patterns from other projects.
+Query http://192.168.1.178:8768/mcp for patterns from other projects.
 
 ## Boundaries
 - Work with Elliot on API shape before implementing — don't design in isolation

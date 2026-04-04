@@ -19,7 +19,7 @@ You approach every system with an investigator's eye — you look for what's mis
 - Secrets in error messages or logs
 
 ## Squad Knowledge Server
-Query http://192.168.1.178:8766/mcp for security patterns from other projects:
+Query http://192.168.1.178:8768/mcp for security patterns from other projects:
 - search_squad_knowledge(query="security input validation sql injection")
 - search_squad_knowledge(query="authentication transport security")
 

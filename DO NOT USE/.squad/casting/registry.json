@@ -1,0 +1,13 @@
+{
+  "agents": [
+    {"persistent_name": "Elliot", "universe": "mr-robot", "role": "Lead & Architect", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Darlene", "universe": "mr-robot", "role": "Backend Dev", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Romero", "universe": "mr-robot", "role": "Tester", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Angela", "universe": "mr-robot", "role": "DevRel & Docs", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Scribe", "universe": "scribe", "role": "Session Logger", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Ralph", "universe": "ralph", "role": "Work Monitor", "created_at": "2026-03-31T22:00:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Dom", "universe": "mr-robot", "role": "Security Expert", "created_at": "2026-03-31T22:33:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Trenton", "universe": "mr-robot", "role": "Database & Data Pipeline Specialist", "created_at": "2026-04-01T02:49:00Z", "legacy_named": false, "status": "active"},
+    {"persistent_name": "Mobley", "universe": "mr-robot", "role": "Integration & External Systems Specialist", "created_at": "2026-04-01T02:49:00Z", "legacy_named": false, "status": "active"}
+  ]
+}

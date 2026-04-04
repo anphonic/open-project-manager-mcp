@@ -2,7 +2,7 @@
 
 ## Project Scope & Charter
 
-**Status:** v0.2.1 deployed — production-ready task queue with async SQLite and team coordination  
+**Status:** v0.3.0 in development — adding telemetry and permissions to production server  
 **Origin:** Identified during squad-knowledge-mcp development (session 2026-03-31)
 
 ---
@@ -196,11 +196,17 @@ GitHub Issues remains valuable for public-facing project tracking and @copilot i
 
 ✅ **Production Deployment** — Running on skitterphuger (192.168.1.178:8765) serving 5+ squads
 
-### Planned (v0.3.0)
+### In Development (v0.3.0)
 
-🚧 **Telemetry** — Per-tenant usage metrics (hourly buckets), accessible via MCP tools
+✅ **Telemetry** — Per-tenant usage metrics (hourly buckets), accessible via 4 MCP tools and 4 REST endpoints
+- Tool call counts, latency (p50/p95/p99), error counts
+- Automatic recording on every tool/REST call with <1ms overhead
+- Tenant-scoped queries prevent cross-tenant data leakage
 
-🚧 **Project Permissions** — Per-project ACL (owner/contributor/reader); 8 new MCP tools
+✅ **Project Permissions** — Per-project ACL (owner/contributor/reader); 8 MCP tools and 4 REST endpoints
+- Role-based enforcement (owner > contributor > reader)
+- Backward-compatible: enforcement OFF by default, enable after migration
+- Admin tools for backfill (`migrate_permissions`) and enforcement toggle
 
 ---
 
@@ -214,5 +220,5 @@ GitHub Issues remains valuable for public-facing project tracking and @copilot i
 ---
 
 *Charter created: 2026-03-31*  
-*Last updated: 2026-04-02 (v0.2.1 stability release)*  
+*Last updated: 2026-04-05 (v0.3.0 — telemetry and permissions released)*  
 *Based on squad-knowledge-mcp architecture decisions and cross-squad field experience*

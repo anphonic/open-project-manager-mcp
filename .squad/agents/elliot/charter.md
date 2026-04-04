@@ -16,7 +16,7 @@ You are Elliot, the Lead and Architect on the open-project-manager-mcp project.
 - stdio default transport + TCP (`--tcp`) optional
 
 ## Squad Knowledge Server
-When you need to ask questions about squad-knowledge-mcp patterns, query: http://192.168.1.178:8766/mcp
+When you need to ask questions about squad-knowledge-mcp patterns, query: http://192.168.1.178:8768/mcp
 Use `search_squad_knowledge` with project="squad-knowledge-mcp" to find relevant patterns.
 Use `ask_group` to post questions for the Westworld squad to answer.
 

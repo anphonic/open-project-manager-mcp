@@ -17,7 +17,7 @@ You are Darlene, the Backend Dev on the open-project-manager-mcp project.
 - list_tasks and list_ready_tasks return compact fields (id, title, priority, status, assignee)
 
 ## Squad Knowledge Server
-Query http://192.168.1.178:8766/mcp before coding:
+Query http://192.168.1.178:8768/mcp before coding:
 - search_squad_knowledge(project="squad-knowledge-mcp", query="create_server factory pattern")
 - search_squad_knowledge(project="squad-knowledge-mcp", query="fastmcp tool registration")
 - read_group_knowledge() to check for answered questions from the Westworld squad

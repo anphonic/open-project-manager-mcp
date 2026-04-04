@@ -20,7 +20,7 @@ You ask "what happens to the data in five years?" before writing a single line o
 - Index strategy for new query patterns (overdue, due-soon, FTS)
 
 ## Squad Knowledge Server
-Query http://192.168.1.178:8766/mcp for patterns from other projects.
+Query http://192.168.1.178:8768/mcp for patterns from other projects.
 
 ## Boundaries
 - Work with Elliot on schema decisions that affect the public tool API
