@@ -54,6 +54,63 @@ _(none yet — directives will be captured here as Andrew states them)_
 - CHARTER updated with v0.3.0 status and feature descriptions
 - REST endpoints table updated with 8 new endpoints
 
+---
+
+## 2026-04-06: Auth-Hang DoS Fix
+
+**Incident:** Unauthenticated HTTP requests caused OPM server to hang and stop responding entirely.
+
+### Root Causes (3 compounding issues)
+
+1. **Incomplete auth gate** — `_EarlyAuthRejectMiddleware` only guarded POST requests with missing Authorization header. Did NOT:
+   - Check GET requests (e.g., `GET /mcp` for SSE stream setup)
+   - Validate token *value* — `Authorization: Bearer wrongtoken` passed straight through
+
+2. **Wrong status code** — FastMCP's `BearerAuthBackend` raises `AuthenticationError` for invalid tokens. Starlette's `default_on_error` returns 400, NOT 401. Also omitted `Connection: close`, leaving connection in ambiguous keep-alive state.
+
+3. **Missing `Connection: close`** — Even 401 responses lacked this header. Uvicorn kept connections alive. Partial body reads before response sent left connections in half-read state preventing subsequent requests.
+
+### Decision (Darlene)
+
+Rewrote `_EarlyAuthRejectMiddleware` to:
+- Guard ALL HTTP methods (not just POST)
+- Validate Bearer token value synchronously using `hmac.compare_digest` against env-var keys
+- Return proper **401** with `Connection: close` and explicit `more_body: False`
+- Skip `/api/` paths (REST endpoints handle own auth)
+- **Move before `SessionActivityMiddleware`** — prevent bad-auth from touching session state or body buffer
+
+**Middleware order (outermost first):**
+```
+ConnectionTimeoutMiddleware
+  _EarlyAuthRejectMiddleware     ← fast 401 + Connection: close before body read
+    SessionActivityMiddleware
+      _FixArgumentsMiddleware
+        Starlette app
+```
+
+### Additional Fixes (Dom)
+
+1. **Body-buffer DoS mitigation** — `_EarlyAuthRejectMiddleware` placed BEFORE `_FixArgumentsMiddleware` to prevent reading 6 MB bodies for unauthenticated POSTs. Prevents Slowloris-style amplification (100 concurrent 6 MB requests = 600 MB memory before rejection).
+
+2. **Auth error sanitization** — `"Invalid API key"` → `"Unauthorized"` and `"Authentication failed"` → `"Unauthorized"`. Prevents auth mechanism type disclosure via error messages.
+
+### Test Results
+
+- **7 new regression tests** in `TestEarlyAuthRejectMiddleware`
+- **394 tests passing** (non-telemetry)
+- **179/180 tests passing** (with fixes)
+- All middleware tests passing, no regressions
+
+### Security Analysis
+
+✅ Unauthenticated requests cannot reach MCP transport (three-layer defense)  
+✅ No state accumulation from failed auth attempts  
+✅ Malformed requests cannot wedge event loop (multiple safeguards)  
+✅ Auth errors don't leak token values or mechanism type  
+✅ Connection lifecycle properly managed  
+
+---
+
 ## Architecture Decisions
 
 ## 2026-03-31: Project bootstrapped

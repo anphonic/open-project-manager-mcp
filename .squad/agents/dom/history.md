@@ -41,7 +41,7 @@ _(Fresh start — 2026-04-03)_
 
 ---
 
-### 2026-04-06: Auth DoS Security Review
+### 2026-04-07: Auth-Hang DoS Fix Verification + Security Hardening
 
 **Bug:** Unauthenticated HTTP requests caused OPM server to hang and stop responding.
 

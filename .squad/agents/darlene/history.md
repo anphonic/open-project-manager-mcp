@@ -49,3 +49,70 @@ Successfully implemented two major features for v0.3.0:
 - 4 security fixes applied (DoS prevention, input validation, permission bypass fix)
 - Migration path complete with backfill tooling
 
+---
+
+### 2026-04-07: Auth-Hang Bug Fix
+
+**Bug:** When OPM receives an HTTP request to `/mcp` (or any non-REST path) with
+no Authorization header OR a wrong Bearer token, the server could hang and stop
+responding entirely.
+
+**Root causes (three compounding issues):**
+
+1. **Incomplete gate** — `_EarlyAuthRejectMiddleware` only rejected POST requests
+   with a *missing* Authorization header. It did NOT:
+   - Check GET requests (e.g. `GET /mcp` to establish an SSE stream)
+   - Validate the token *value* — `Authorization: Bearer wrongtoken` passed straight
+     through to FastMCP's Starlette `AuthenticationMiddleware`.
+
+2. **400 instead of 401 for wrong tokens** — FastMCP's `BearerAuthBackend` raises
+   `AuthenticationError` for an invalid token. Starlette's `default_on_error`
+   returns `PlainTextResponse(status_code=400)`, NOT 401. This also omits
+   `Connection: close`, leaving the connection in an ambiguous keep-alive state.
+
+3. **Missing `Connection: close`** — the old 401 response for missing headers did
+   not include `Connection: close`. Uvicorn kept the connection alive; if the
+   request body was not fully consumed before the response was sent the connection
+   could be left in a half-read state that prevents subsequent requests from being
+   processed on the same TCP connection.
+
+**Fix (in `__main__.py`):**
+- Rewrote `_EarlyAuthRejectMiddleware` to:
+   - Accept `tenant_keys: dict | None` (flat env-var keys) instead of `requires_auth: bool`
+   - Guard ALL HTTP methods (not just POST) against bad auth
+   - Validate the Bearer token value synchronously against env-var keys using
+     `hmac.compare_digest` (constant-time) — no DB call, no `asyncio.to_thread`
+   - Return proper **401** (not 400) with `Connection: close` and explicit
+     `more_body: False`
+   - Skip `/api/` prefix (REST endpoints have their own `_check_auth`)
+   - Reordered middleware: auth gate now runs **before** `SessionActivityMiddleware`
+     so bad-auth requests never update session state or touch the body buffer
+
+**Middleware order after fix (outermost first):**
+```
+ConnectionTimeoutMiddleware
+  _EarlyAuthRejectMiddleware   ← fast 401, Connection: close, before body read
+    SessionActivityMiddleware
+      _FixArgumentsMiddleware
+        Starlette app (MCP + REST)
+```
+
+**Manual repro for Dom to verify:**
+```bash
+# Server started with OPM_TENANT_KEYS='{"squad":"validtoken"}' --http
+# 1. No header — must return 401 immediately with Connection: close
+curl -v -X POST http://host:8765/mcp
+# 2. Wrong token — must return 401 (was 400 before fix), server must stay responsive
+curl -v -X POST http://host:8765/mcp -H "Authorization: Bearer wrongtoken"
+# 3. GET without auth — must return 401 (was not caught before)
+curl -v http://host:8765/mcp
+# 4. Valid token — must reach MCP transport normally
+curl -v -X POST http://host:8765/mcp -H "Authorization: Bearer validtoken" \
+     -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"initialize","id":1}'
+# After all 4 calls the server must still respond to new requests.
+```
+
+**Testing Notes:**
+- 7 new regression tests in `TestEarlyAuthRejectMiddleware` in `tests/test_middleware.py`
+- All 394 non-telemetry tests pass; 4 pre-existing async telemetry failures unchanged
+
