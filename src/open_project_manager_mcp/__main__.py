@@ -177,6 +177,51 @@ class ConnectionTimeoutMiddleware:
                 raise
 
 
+class _EarlyAuthRejectMiddleware:
+    """Reject clearly unauthenticated requests before body buffering.
+
+    When bearer auth is required, POST requests without an Authorization header
+    are rejected with 401 immediately — before _FixArgumentsMiddleware reads and
+    buffers the entire request body.  This prevents a trivial DoS where an
+    unauthenticated actor floods the server with large POST bodies that are
+    buffered into memory only to be rejected by the SDK's auth middleware.
+
+    REST API paths (/api/) are excluded because they have their own auth
+    handling (including the registration endpoint which uses a body-based key).
+    """
+
+    def __init__(self, app, requires_auth: bool):
+        self.app = app
+        self.requires_auth = requires_auth
+
+    async def __call__(self, scope, receive, send):
+        if (
+            self.requires_auth
+            and scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and not scope.get("path", "").startswith("/api/")
+        ):
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"")
+            if not auth_header.startswith(b"Bearer "):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"error":"Unauthorized"}',
+                    "more_body": False,
+                })
+                return
+
+        await self.app(scope, receive, send)
+
+
 def _load_tenant_keys() -> dict[str, dict[str, object]] | None:
     """Load tenant API keys from OPM_TENANT_KEYS env var.
 
@@ -505,9 +550,11 @@ def main():
             # Middleware order (outermost first):
             # 1. ConnectionTimeoutMiddleware (kill long connections)
             # 2. SessionActivityMiddleware (track activity)
-            # 3. _FixArgumentsMiddleware (patch empty args)
-            # 4. Starlette app
+            # 3. _EarlyAuthRejectMiddleware (reject unauth before body read)
+            # 4. _FixArgumentsMiddleware (patch empty args)
+            # 5. Starlette app
             app = _FixArgumentsMiddleware(app)
+            app = _EarlyAuthRejectMiddleware(app, requires_auth=bool(flat_keys))
             app = SessionActivityMiddleware(app, tracker)
             app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
         else:
@@ -530,6 +577,7 @@ def main():
                     lifespan=_make_lifespan(mcp_sse_asgi),
                 )
             app = _FixArgumentsMiddleware(app)
+            app = _EarlyAuthRejectMiddleware(app, requires_auth=bool(flat_keys))
             app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
 
         uvicorn.run(

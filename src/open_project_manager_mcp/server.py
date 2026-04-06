@@ -74,7 +74,7 @@ class ApiKeyVerifier(TokenVerifier):
         try:
             tenant_id = await self._verify(token)
             if not tenant_id:
-                raise AuthenticationError("Invalid API key")
+                raise AuthenticationError("Unauthorized")
             return AccessToken(
                 token=token,
                 client_id=tenant_id,
@@ -83,7 +83,7 @@ class ApiKeyVerifier(TokenVerifier):
         except AuthenticationError:
             raise
         except Exception:
-            raise AuthenticationError("Authentication failed") from None
+            raise AuthenticationError("Unauthorized") from None
 
 
 _SCHEMA = """
