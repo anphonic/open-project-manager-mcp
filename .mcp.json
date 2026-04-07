@@ -2,15 +2,19 @@
   "mcpServers": {
     "squad-knowledge": {
       "type": "sse",
-      "url": "http://192.168.1.178:8768"
+      "url": "http://192.168.1.178:8768/sse"
     },
     "godot-docs": {
       "type": "http",
       "url": "http://192.168.1.178:8767/mcp"
     },
     "blender": {
-      "type": "http",
-      "url": "http://192.168.1.178:8760/mcp"
+      "type": "sse",
+      "url": "http://192.168.1.178:8760/sse"
+    },
+    "kicad-native": {
+      "type": "sse",
+      "url": "http://192.168.1.178:8770/sse"
     },
     "open-project-manager": {
       "type": "http",
