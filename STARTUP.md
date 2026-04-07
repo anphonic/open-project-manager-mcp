@@ -5,47 +5,36 @@ Read this first. Every time.
 
 ---
 
-## 1. Set Your Environment Variable
+## 1. Copilot Client Config (mcp-config.json)
 
-Every session needs `OPM_BEARER_TOKEN` set **before** any agent connects to OPM.
+**CRITICAL: Do NOT include a `headers` block for OPM in `mcp-config.json`.**
+Including `headers` (e.g., for Bearer tokens) causes the Copilot CLI to abandon the SSE transport and silently fall back to HTTP POSTs (`/mcp`), which breaks the connection.
 
-The token to use depends on which identity you're operating as:
-
-| Identity | Use When |
-|----------|----------|
-| `coordinator` | Ted / Squad coordinator sessions (default for this project) |
-| `mrrobot` | MrRobot squad agents |
-| `westworld` | Westworld squad agents |
-| `fsociety` | FSociety squad agents |
-| `ralph` | Ralph monitor agent |
-
-**To get the token values**, read them from the server:
-
-```bash
-ssh skitterphuger@192.168.1.178 "grep OPM_TENANT_KEYS /home/skitterphuger/mcp/open-project-manager/start.sh"
+```json
+{
+  "mcpServers": {
+    "open-project-manager": {
+      "type": "sse",
+      "url": "http://<SERVER_IP>:8765/sse",
+      "description": "Open Project Manager (OPM) Tasks and Squad Database"
+    }
+  }
+}
 ```
 
-Then set in your shell (Windows):
-
-```powershell
-$env:OPM_BEARER_TOKEN = "<coordinator-key-from-start.sh>"
-```
-
-Or permanently via Windows System Environment Variables so it survives session restarts.
-
-> ⚠️ Tokens are **not** stored in this repo. The authoritative source is `start.sh` on skitterphuger.
+The server runs in unauthenticated mode on the LAN (`OPM_TENANT_KEYS=""` with `--allow-unauthenticated-network`). Do not add auth headers — they will break the connection.
 
 ---
 
 ## 2. Verify OPM Is Running
 
 ```bash
-ssh skitterphuger@192.168.1.178 "curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer <your-token>' http://127.0.0.1:8765/api/v1/stats"
+ssh skitterphuger@192.168.1.178 "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/sse"
 ```
 
-Expected: `200`
+Expected: `200` (SSE stream will hang open — that's normal, Ctrl+C to cancel)
 
-**If you get a hang or no response** — OPM is down or hung. Restart it:
+**If OPM is down or hung:**
 
 ```bash
 # Find what's holding port 8765
@@ -55,28 +44,27 @@ ssh skitterphuger@192.168.1.178 "ss -tlnp sport = :8765"
 ssh skitterphuger@192.168.1.178 "kill -9 <PID>"
 
 # Start fresh
-ssh skitterphuger@192.168.1.178 "bash -c 'nohup /home/skitterphuger/mcp/open-project-manager/start.sh </dev/null >/tmp/opm.log 2>&1 & disown && echo STARTED'"
+ssh skitterphuger@192.168.1.178 "bash -c 'nohup /home/skitterphuger/mcp/start-opm-fixed.sh </dev/null >/home/skitterphuger/mcp/project-manager-mcp.log 2>&1 & disown && echo STARTED'"
 
 # Wait 4 seconds, verify
-ssh skitterphuger@192.168.1.178 "sleep 4 && curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer <your-token>' http://127.0.0.1:8765/api/v1/stats"
+ssh skitterphuger@192.168.1.178 "sleep 4 && ss -tlnp | grep 8765"
 ```
-
-> ⚠️ Do NOT use PowerShell `Invoke-WebRequest` to test OPM from the Windows dev machine — it always times out. Use SSH+curl only.
 
 ---
 
 ## 3. Infrastructure Reference
 
-| Service | URL | Auth |
-|---------|-----|------|
-| OPM (task queue) | `http://192.168.1.178:8765/mcp` | Bearer `$OPM_BEARER_TOKEN` |
-| OPM REST API | `http://192.168.1.178:8765/api/v1/` | Bearer `$OPM_BEARER_TOKEN` |
-| Squad Knowledge | `http://192.168.1.178:8768` | None |
-| Godot SKS | `http://192.168.1.178:8767/mcp` | — |
-| Blender SKS | `http://192.168.1.178:8760/mcp` | — |
-| SSH | `ssh skitterphuger@192.168.1.178` | No password |
+| Service | Type | URL | Auth |
+|---------|------|-----|------|
+| OPM (SSE) | `sse` | `http://192.168.1.178:8765/sse` | None (LAN unauthenticated) |
+| OPM REST API | HTTP | `http://192.168.1.178:8765/api/v1/` | None (LAN unauthenticated) |
+| Squad Knowledge (SKS) | `sse` | `http://192.168.1.178:8768/sse` | None |
+| Godot Docs | `http` | `http://192.168.1.178:8767/mcp` | None |
+| KiCAD | `sse` | `http://192.168.1.178:8770/sse` | None |
+| Blender | `sse` | `http://192.168.1.178:8760/sse` | None |
+| SSH | — | `ssh skitterphuger@192.168.1.178` | No password |
 
-> ⚠️ Squad Knowledge is at **8768** — never 8766. The `/` root returns 404 (normal). Use `/sse` endpoint.
+> ⚠️ **Transport types matter:** FastMCP servers (OPM, SKS, KiCAD, Blender) use `"type": "sse"` with `/sse` URLs. Custom HTTP-only servers (Godot) use `"type": "http"` with `/mcp` URLs.
 
 ---
 
@@ -84,22 +72,23 @@ ssh skitterphuger@192.168.1.178 "sleep 4 && curl -s -o /dev/null -w '%{http_code
 
 | File | Purpose |
 |------|---------|
-| `/home/skitterphuger/mcp/open-project-manager/start.sh` | Authoritative start script + all tenant tokens |
+| `/home/skitterphuger/mcp/start-opm-fixed.sh` | Authoritative start script (SSE mode, unauthenticated) |
+| `/home/skitterphuger/mcp/.env` | Contains OPM_TENANT_KEYS (sourced by start script, NOT in git) |
 | `/home/skitterphuger/mcp/env/bin/` | Python venv — use this pip, not system pip |
-| `/tmp/opm.log` | Live server log |
+| `/home/skitterphuger/mcp/project-manager-mcp.log` | Live server log |
 | `/home/skitterphuger/.local/share/open-project-manager-mcp/tasks.db` | SQLite database |
 
 ---
 
 ## 5. Deploy Updated Package
 
-```powershell
-# 1. Build wheel (Windows dev machine)
-cd J:\Coding\open-project-manager-mcp
+```bash
+# 1. Build wheel (dev machine)
+cd /path/to/open-project-manager-mcp
 python -m build --wheel
 
 # 2. SCP to server
-scp dist\open_project_manager_mcp-*.whl skitterphuger@192.168.1.178:/tmp/
+scp dist/open_project_manager_mcp-*.whl skitterphuger@192.168.1.178:/tmp/
 
 # 3. Install into venv
 ssh skitterphuger@192.168.1.178 "/home/skitterphuger/mcp/env/bin/pip install --upgrade /tmp/open_project_manager_mcp-*.whl --quiet"
@@ -108,7 +97,7 @@ ssh skitterphuger@192.168.1.178 "/home/skitterphuger/mcp/env/bin/pip install --u
 ssh skitterphuger@192.168.1.178 "ss -tlnp sport = :8765"
 # note PID from output, then:
 ssh skitterphuger@192.168.1.178 "kill -9 <PID>"
-ssh skitterphuger@192.168.1.178 "bash -c 'nohup /home/skitterphuger/mcp/open-project-manager/start.sh </dev/null >/tmp/opm.log 2>&1 & disown && echo STARTED'"
+ssh skitterphuger@192.168.1.178 "bash -c 'nohup /home/skitterphuger/mcp/start-opm-fixed.sh </dev/null >/home/skitterphuger/mcp/project-manager-mcp.log 2>&1 & disown && echo STARTED'"
 ```
 
 ---
@@ -117,8 +106,8 @@ ssh skitterphuger@192.168.1.178 "bash -c 'nohup /home/skitterphuger/mcp/open-pro
 
 Before doing any work, confirm:
 
-- [ ] `OPM_BEARER_TOKEN` is set in the current shell
-- [ ] OPM returns `200` on health check
+- [ ] OPM returns `200` on SSE endpoint check
+- [ ] No `headers` block in `mcp-config.json` for OPM
 - [ ] Read `.squad/team.md` and `.squad/decisions.md`
 - [ ] Queried Squad Knowledge for recent decisions
 
