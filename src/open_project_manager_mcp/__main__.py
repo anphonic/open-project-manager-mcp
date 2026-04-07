@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -178,38 +179,56 @@ class ConnectionTimeoutMiddleware:
 
 
 class _EarlyAuthRejectMiddleware:
-    """Reject clearly unauthenticated requests before body buffering.
+    """Reject unauthenticated/invalid requests before body buffering.
 
-    When bearer auth is required, POST requests without an Authorization header
-    are rejected with 401 immediately — before _FixArgumentsMiddleware reads and
-    buffers the entire request body.  This prevents a trivial DoS where an
-    unauthenticated actor floods the server with large POST bodies that are
-    buffered into memory only to be rejected by the SDK's auth middleware.
+    When bearer auth is required, ALL HTTP requests to non-/api/ paths are
+    validated synchronously against the env-var tenant keys using constant-time
+    comparison (hmac.compare_digest).  This prevents two attack classes:
+
+    1. DoS via body buffering — unauthenticated actors flooding the server with
+       large POST bodies that _FixArgumentsMiddleware would buffer before the
+       SDK's auth layer could reject them.
+    2. Auth-hang DoS — ApiKeyVerifier.verify_token() is async and involves a
+       DB query; an invalid token would previously reach Starlette's
+       AuthenticationMiddleware, which calls default_on_error and returns HTTP
+       400 (not 401) for any AuthenticationError.  By rejecting here first with
+       a synchronous check we avoid touching the event loop at all for bad keys.
 
     REST API paths (/api/) are excluded because they have their own auth
     handling (including the registration endpoint which uses a body-based key).
     """
 
-    def __init__(self, app, requires_auth: bool):
+    def __init__(self, app, tenant_keys: dict | None):
         self.app = app
-        self.requires_auth = requires_auth
+        self.tenant_keys = tenant_keys
 
     async def __call__(self, scope, receive, send):
         if (
-            self.requires_auth
+            self.tenant_keys
             and scope["type"] == "http"
-            and scope.get("method") == "POST"
             and not scope.get("path", "").startswith("/api/")
         ):
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"")
-            if not auth_header.startswith(b"Bearer "):
+
+            # Validate token value using constant-time comparison against all
+            # known env-var keys.  Bearer prefix is required.
+            authenticated = False
+            if auth_header.startswith(b"Bearer "):
+                token = auth_header[7:].decode("utf-8", errors="replace")
+                for key in self.tenant_keys.values():
+                    if hmac.compare_digest(token, key):
+                        authenticated = True
+                        break
+
+            if not authenticated:
                 await send({
                     "type": "http.response.start",
                     "status": 401,
                     "headers": [
                         (b"content-type", b"application/json"),
                         (b"www-authenticate", b"Bearer"),
+                        (b"connection", b"close"),
                     ],
                 })
                 await send({
@@ -549,13 +568,13 @@ def main():
             
             # Middleware order (outermost first):
             # 1. ConnectionTimeoutMiddleware (kill long connections)
-            # 2. SessionActivityMiddleware (track activity)
-            # 3. _EarlyAuthRejectMiddleware (reject unauth before body read)
+            # 2. _EarlyAuthRejectMiddleware (fast 401 + Connection: close before body read)
+            # 3. SessionActivityMiddleware (track activity — only sees authenticated requests)
             # 4. _FixArgumentsMiddleware (patch empty args)
             # 5. Starlette app
             app = _FixArgumentsMiddleware(app)
-            app = _EarlyAuthRejectMiddleware(app, requires_auth=bool(flat_keys))
             app = SessionActivityMiddleware(app, tracker)
+            app = _EarlyAuthRejectMiddleware(app, tenant_keys=flat_keys)
             app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
         else:
             print(
@@ -577,7 +596,7 @@ def main():
                     lifespan=_make_lifespan(mcp_sse_asgi),
                 )
             app = _FixArgumentsMiddleware(app)
-            app = _EarlyAuthRejectMiddleware(app, requires_auth=bool(flat_keys))
+            app = _EarlyAuthRejectMiddleware(app, tenant_keys=flat_keys)
             app = ConnectionTimeoutMiddleware(app, max_connection_age=connection_timeout)
 
         uvicorn.run(

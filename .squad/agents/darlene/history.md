@@ -116,3 +116,72 @@ curl -v -X POST http://host:8765/mcp -H "Authorization: Bearer validtoken" \
 - 7 new regression tests in `TestEarlyAuthRejectMiddleware` in `tests/test_middleware.py`
 - All 394 non-telemetry tests pass; 4 pre-existing async telemetry failures unchanged
 
+---
+
+### 2026-04-07: Copilot CLI POST /mcp Returns 400 — Root Cause Traced & Fixed
+
+**Symptom:** Copilot CLI MCP client (type: "http") received HTTP 400 Bad Request on every
+POST to `/mcp` even though the REST `/api/v1/stats` endpoint returned 200 with the same
+token.
+
+**True root cause:**
+
+`ApiKeyVerifier.verify_token()` in `server.py` **raised** `AuthenticationError` for invalid
+or unrecognized tokens instead of **returning `None`**.  This violates the `TokenVerifier`
+protocol contract.  Starlette's `AuthenticationMiddleware` routes any exception from
+`authenticate()` to `default_on_error`, which returns `PlainTextResponse(status_code=400)`
+— not 401.
+
+The full execution path for a wrong/missing token before the fix:
+```
+_EarlyAuthRejectMiddleware (old)
+  → passed "Bearer wrongtoken" through (only checked prefix, not value)
+    → _FixArgumentsMiddleware buffered full body
+      → FastMCP Starlette AuthenticationMiddleware
+          → BearerAuthBackend.authenticate()
+              → ApiKeyVerifier.verify_token()  ← RAISED AuthenticationError
+          → default_on_error → PlainTextResponse(400)  ← WRONG STATUS
+```
+
+**Additional sub-root-cause:** The `_EarlyAuthRejectMiddleware` rewrite described in the
+previous entry was partially but not fully applied.  The middleware signature still used
+`requires_auth: bool` rather than `tenant_keys: dict | None`, and token VALUE validation
+was missing.  This allowed wrong tokens to reach FastMCP's auth layer and trigger the 400.
+
+**How REST was unaffected:** REST endpoints use `_check_auth()` which calls `_verify_bearer`
+directly and returns JSONResponse 401 on failure — bypassing the Starlette
+`AuthenticationMiddleware` entirely.
+
+**Complete fix (this session):**
+
+1. **`server.py`:** Changed `ApiKeyVerifier.verify_token()` to `return None` instead of
+   `raise AuthenticationError` for invalid tokens.  Protocol-compliant: `BearerAuthBackend`
+   now gets `None`, returns `None` itself, Starlette sets `UnauthenticatedUser`,
+   `RequireAuthMiddleware` sends 401 with proper WWW-Authenticate header.
+
+2. **`__main__.py`:** Completed the `_EarlyAuthRejectMiddleware` rewrite:
+   - Signature: `tenant_keys: dict | None` (was `requires_auth: bool`)
+   - Guards ALL HTTP methods (was POST only)
+   - Validates token VALUE with `hmac.compare_digest` before body buffer
+   - Returns 401 with `Connection: close` and `more_body: False`
+
+3. **`__main__.py`:** Fixed middleware ordering: `_EarlyAuthRejectMiddleware` now runs
+   **before** `SessionActivityMiddleware` so invalid requests never touch session state.
+
+**Verification (local):**
+```
+POST /mcp wrong token → 401 {"error":"Unauthorized"}  (was 400)
+POST /mcp no token    → 401 {"error":"Unauthorized"}  (was 400)
+POST /mcp valid token → 200 SSE stream                (unchanged)
+```
+179 tests pass; 1 pre-existing telemetry test unchanged.
+
+**Key learnings:**
+- `TokenVerifier.verify_token()` MUST return `None` for invalid tokens — raising an
+  exception propagates through `BearerAuthBackend` to `default_on_error` → 400.
+- `ApiKeyVerifier.verify_token()` must never raise; wrap everything in `except Exception:
+  return None`.
+- If MCP returns 400 for auth failures but REST returns 401, the root cause is almost
+  always an exception propagating through `AuthenticationMiddleware`.
+
+

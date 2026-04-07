@@ -20,7 +20,6 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.authentication import AuthenticationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, Router
@@ -71,19 +70,21 @@ class ApiKeyVerifier(TokenVerifier):
         self._verify = verify_fn
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        # Must return None (not raise) for invalid tokens — the TokenVerifier
+        # protocol contract requires None on failure.  Raising AuthenticationError
+        # propagates through BearerAuthBackend to Starlette's default_on_error,
+        # which returns HTTP 400 instead of the correct HTTP 401.
         try:
             tenant_id = await self._verify(token)
             if not tenant_id:
-                raise AuthenticationError("Unauthorized")
+                return None
             return AccessToken(
                 token=token,
                 client_id=tenant_id,
                 scopes=["api"],
             )
-        except AuthenticationError:
-            raise
         except Exception:
-            raise AuthenticationError("Unauthorized") from None
+            return None
 
 
 _SCHEMA = """
