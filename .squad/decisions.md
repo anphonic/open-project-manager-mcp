@@ -4,7 +4,9 @@
 
 ## Active Directives
 
-_(none yet — directives will be captured here as Andrew states them)_
+**2026-04-06T11:48:20Z:** Project-specific agent definitions (e.g., `.github/agents/`) are canonical, not global templates.
+
+**2026-04-06T18:47:45Z:** Every Copilot CLI session must have OPM configured at 192.168.1.178:8765 with default bearer token. Always ensure reachability at session start.
 
 ---
 
@@ -108,6 +110,70 @@ ConnectionTimeoutMiddleware
 ✅ Malformed requests cannot wedge event loop (multiple safeguards)  
 ✅ Auth errors don't leak token values or mechanism type  
 ✅ Connection lifecycle properly managed  
+
+---
+
+## 2026-04-07: MCP POST /mcp Returns 400 — Two Compounding Bugs Fixed
+
+**Incident:** Copilot CLI POST requests to `/mcp` returned HTTP 400 Bad Request, even though REST `/api/v1/stats` worked with the same token.
+
+### Root Causes
+
+**1. ApiKeyVerifier Protocol Violation**
+
+`ApiKeyVerifier.verify_token()` raised `AuthenticationError` for invalid tokens instead of returning `None`. This violated the `TokenVerifier` protocol. Starlette's `default_on_error` converts any exception to HTTP 400, not 401.
+
+**2. Incomplete _EarlyAuthRejectMiddleware Rewrite**
+
+The rewrite was partially applied:
+- Still used `requires_auth: bool` signature (should be `tenant_keys: dict | None`)
+- Only guarded POST requests (missed GET and other methods)
+- Never validated token VALUE — `Authorization: Bearer wrongtoken` passed through to FastMCP
+
+Wrong tokens reached FastMCP's auth layer, where the 400 was generated.
+
+### Fixes
+
+**Fix 1: ApiKeyVerifier (server.py)**
+```python
+async def verify_token(self, token: str) -> AccessToken | None:
+    try:
+        tenant_id = await self._verify(token)
+        if not tenant_id:
+            return None  # protocol-compliant
+        return AccessToken(token=token, client_id=tenant_id, scopes=["api"])
+    except Exception:
+        return None  # never raise
+```
+
+**Fix 2: _EarlyAuthRejectMiddleware (__main__.py)**
+- Signature: `tenant_keys: dict | None` (validates env-var keys only, not DB keys)
+- Guards ALL HTTP methods with `hmac.compare_digest` synchronous token validation
+- Returns 401 with `Connection: close` and `more_body: False`
+- Skips `/api/` paths (REST handles own auth)
+- Runs BEFORE `SessionActivityMiddleware` (before session state or body buffering)
+
+**Middleware order (outermost first):**
+```
+ConnectionTimeoutMiddleware
+  _EarlyAuthRejectMiddleware     ← fast 401 + Connection: close before body read
+    SessionActivityMiddleware
+      _FixArgumentsMiddleware
+        Starlette app
+```
+
+### Test Results
+
+- **179 tests pass** (1 pre-existing telemetry timing failure unchanged)
+- **All new middleware tests pass**
+- Wrong/missing token → 401 ✅
+- Valid token → 200 SSE stream ✅
+- No regressions
+
+### Files Changed
+
+- `src/open_project_manager_mcp/server.py` — `ApiKeyVerifier.verify_token()` fix
+- `src/open_project_manager_mcp/__main__.py` — `_EarlyAuthRejectMiddleware` rewrite + middleware order fix
 
 ---
 
